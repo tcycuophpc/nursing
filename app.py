@@ -6,7 +6,7 @@ import calendar
 st.set_page_config(page_title="Nurse Roster (ID + MustWork/MustOff)", layout="wide")
 
 st.title("🩺 護理師排班工具（ID｜不含 A 班｜必上/必休｜每日達標檢視）")
-st.caption("D=出勤、O=休假；依你輸入/上傳的 ID 自動辨識人數，支援必上/必休設定與每日人力達標紅黃綠檢視。")
+st.caption("D=出勤、O=休假；依你輸入/上傳的 ID 自動辨識人數，支援必上/必休設定與每日人力達標檢視。")
 
 # ========= Helpers =========
 def days_in_month(year: int, month: int) -> int:
@@ -44,7 +44,8 @@ def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must
             dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
             if nid in pref_map and dt.year == year and dt.month == month:
                 pref_map[nid].add(int(dt.day))
-        except: pass
+        except: 
+            pass
 
     # Must work / must off maps
     mustW = {nid: set() for nid in id_list}
@@ -54,13 +55,15 @@ def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must
             dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
             if nid in mustW and dt.year == year and dt.month == month:
                 mustW[nid].add(int(dt.day))
-        except: pass
+        except: 
+            pass
     for r in must_off_df.itertuples(index=False):
         try:
             dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
             if nid in mustO and dt.year == year and dt.month == month:
                 mustO[nid].add(int(dt.day))
-        except: pass
+        except: 
+            pass
 
     demand_map = {int(r.day): int(r.D_required) for r in demand_df.itertuples(index=False)}
 
@@ -73,7 +76,7 @@ def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must
             if 1 <= d <= days:
                 schedule[nid][d] = "O"
 
-    # Apply preferences (as soft O)
+    # Apply preferences (soft O)
     for nid in id_list:
         for d in pref_map[nid]:
             if 1 <= d <= days and schedule[nid][d] == "":
@@ -84,7 +87,7 @@ def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must
     daily_info = []  # for compliance table
     for d in range(1, days + 1):
         req = max(0, int(demand_map.get(d, 0)))
-        # 1) place must-work
+        # 1) must-work
         mw_today = [nid for nid in id_list if d in mustW[nid]]
         for nid in mw_today:
             schedule[nid][d] = "D"
@@ -92,9 +95,9 @@ def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must
             assigned_D[nid] += 1
         cur = len(mw_today)
 
-        # 2) fill remaining slots fairly (skip those marked O and already D)
+        # 2) fill remaining fairly
         if cur < req:
-            candidates = [nid for nid in id_list if schedule[nid][d] != "O" and schedule[nid][d] != "D"]
+            candidates = [nid for nid in id_list if schedule[nid][d] not in ("O", "D")]
             candidates.sort(key=lambda k: (assigned_D[k], k))
             need_more = req - cur
             chosen = candidates[:need_more]
@@ -102,12 +105,12 @@ def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must
                 schedule[nid][d] = "D"
                 assigned_D[nid] += 1
 
-        # 3) set blanks to O
+        # 3) blanks -> O
         for nid in id_list:
             if schedule[nid][d] == "":
                 schedule[nid][d] = "O"
 
-        # collect compliance
+        # compliance
         actual = sum(1 for nid in id_list if schedule[nid][d] == "D")
         delta = actual - req
         status = "🟢 達標" if actual == req else ("🟡 超編(+{})".format(delta) if delta > 0 else "🔴 不足({})".format(delta))
@@ -168,6 +171,7 @@ with st.sidebar:
 st.subheader("🆔 護理師 ID 清單（可直接貼上）")
 id_text = st.text_area("輸入 ID（逗號/空白/換行分隔；例：101 102 103 或 101,102,103）", value="", height=90)
 
+# 名單、偏好、必上/必休
 if nurses_file:
     nurses_df = pd.read_csv(nurses_file)
     uploaded_ids = [int(x) for x in pd.Series(nurses_df["id"]).dropna().unique().tolist()]
@@ -239,13 +243,11 @@ prefs_edit = st.data_editor(show_prefs, num_rows="dynamic", use_container_width=
 
 st.subheader("✅ 必上（硬性出勤）")
 mw_show = must_work_df[must_work_df["date"].astype(str).str.startswith(month_prefix)] if "date" in must_work_df.columns else must_work_df
-mw_edit = st.data_editor(mw_show, num_rows="dynamic", use_container_width=True, height=200, key="mw_edit",
-                         help="欄位：nurse_id（整數）、date（YYYY-MM-DD）。當日將強制安排 D。")
+mw_edit = st.data_editor(mw_show, num_rows="dynamic", use_container_width=True, height=200, key="mw_edit")
 
 st.subheader("⛔ 必休（硬性休假）")
 mo_show = must_off_df[must_off_df["date"].astype(str).str.startswith(month_prefix)] if "date" in must_off_df.columns else must_off_df
-mo_edit = st.data_editor(mo_show, num_rows="dynamic", use_container_width=True, height=200, key="mo_edit",
-                         help="欄位：nurse_id（整數）、date（YYYY-MM-DD）。當日將強制安排 O。")
+mo_edit = st.data_editor(mo_show, num_rows="dynamic", use_container_width=True, height=200, key="mo_edit")
 
 # ========= 產生班表 =========
 if st.button("🚀 產生班表"):
@@ -277,13 +279,13 @@ if st.button("🚀 產生班表"):
     st.download_button("⬇️ 下載 CSV 每日達標", data=compliance_df.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"compliance_{year}-{month:02d}.csv")
 else:
-    st.info("請先確認：ID 清單、每日需求表、想休/必上/必休，再按「產生班表」。")
+    st.info("請確認：ID、每日需求、想休/必上/必休 → 然後按「產生班表」。")
 
 st.markdown("""
 ---
 **說明**
 - 系統整合 ID 來源：手動輸入、名單檔、想休檔、必上/必休檔（聯集）。  
-- 「必上」會先填入 D，再補足當日需求；「必休」會先鎖 O。  
+- 「必上」會先填 D，再補足當日需求；「必休」會先鎖 O。  
 - 「每日人力達標檢視」：🟢達標、🟡超編、🔴不足。  
 - 僅 D/O，無 A 班與 E/N 細班；若人力遠大於需求，理論平均 O 會高，可能超過你的 O 上限。
 """)
