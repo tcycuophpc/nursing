@@ -4,10 +4,10 @@ from datetime import datetime, date
 import calendar
 from math import ceil
 
-st.set_page_config(page_title="Nurse Roster • Legal Min + Senior 1/3 + Weekly Off Auto", layout="wide")
+st.set_page_config(page_title="Nurse Roster • Legal Min + Senior 1/3 + Weekly Off + Holiday O", layout="wide")
 
-st.title("🩺 三班制排班｜法定最低 + 白班資深≥1/3 + 新人1:4–1:5 + 每週至少1日O自動補")
-st.caption("固定班別D/E/N；需求=床數×護病比(區間)×假日係數；依醫院層級自動套用衛福部法定最低；白班每日資深≥1/3；新人以1:4–1:5換算能力單位；每人每週至少1日O，未排則自動補，且不破壞法定最低與11小時休息。")
+st.title("🩺 三班制排班｜法定最低 + 白班資深≥1/3 + 新人1:4–1:5 + 每週至少1日O + 假日可休即打O")
+st.caption("固定班別D/E/N；需求=床數×護病比(區間)×假日係數；依醫院層級套用衛福部法定最低下限；白班每日資深≥1/3；新人以1:4–1:5換算能力單位；自動補每週至少1日O；勾選可於假日優先排休（能休就打O）；全程檢查11小時休息。")
 
 # ================= Helpers =================
 ORDER = ["D", "E", "N"]
@@ -121,13 +121,14 @@ with st.sidebar:
     n_avg = (n_ratio_min + n_ratio_max) / 2.0
 
     st.subheader("新人護病比（固定 1:4–1:5）")
-    st.caption("新人單位 = 4.5 / 班別平均護病比（白~6.5、小夜~11、大夜~15.5），只影響每日單位達標，不影響休假天數。")
+    st.caption("新人單位 = 4.5 / 班別平均護病比（白~6.5、小夜~11、大夜~15.5）；只影響每日單位達標，不影響休假天數。")
     jr_avg = 4.5
 
-    st.subheader("假日係數與跨班平衡")
+    st.subheader("假日係數與跨班平衡/排休")
     apply_holiday = st.checkbox("套用假日係數於週日與下方假日清單", value=True)
     holiday_factor = st.number_input("假日係數（例如 1.15）", 1.00, 3.00, 1.15, step=0.05, format="%.2f")
     allow_cross = st.checkbox("允許同日跨班平衡（以單位計）", value=True)
+    prefer_off_holiday = st.checkbox("假日優先排休（能休就自動打 O）", value=True)
 
     st.subheader("醫院層級（影響法定最低）")
     hospital_level = st.selectbox("醫院層級（決定法定三班護病比）", ["醫學中心", "區域醫院", "地區醫院"], index=0)
@@ -163,7 +164,7 @@ st.subheader("📝 想休（軟性）")
 wish_off_df = st.data_editor(pd.DataFrame(columns=["nurse_id","date"]),
                              use_container_width=True, num_rows="dynamic", height=220, key="wish_edit")
 
-st.subheader("📅 指定假日清單（影響假日係數與『例假日放假數』）")
+st.subheader("📅 指定假日清單（影響假日係數與『本月例假日放假數』）")
 holiday_df = st.data_editor(pd.DataFrame(columns=["date"]), use_container_width=True, num_rows="dynamic", height=200, key="holidays")
 holiday_set = set()
 for r in holiday_df.itertuples(index=False):
@@ -258,18 +259,12 @@ def build_initial_schedule(year, month, roles_df, must_off_df, wish_off_df, dema
 
     # 需求（單位）
     demand = {}
-    legal_min_by_day = {}
     for r in demand_df.itertuples(index=False):
         d = int(r.day)
         demand[d] = {
             "D": (int(r.D_min_units), int(r.D_max_units)),
             "E": (int(r.E_min_units), int(r.E_max_units)),
             "N": (int(r.N_min_units), int(r.N_max_units)),
-        }
-        legal_min_by_day[d] = {
-            "D": int(getattr(r,"D_legal_min_units",0)),
-            "E": int(getattr(r,"E_legal_min_units",0)),
-            "N": int(getattr(r,"N_legal_min_units",0)),
         }
 
     # 初始化
@@ -309,7 +304,7 @@ def build_initial_schedule(year, month, roles_df, must_off_df, wish_off_df, dema
         pool.sort()
         return [nid for (_,_,nid) in pool]
 
-    # 逐日逐班：先達 "min_units"（已含與法定下限對齊），再補到 "max_units"；白班資深≥1/3（以人數）
+    # 逐日逐班：先達 "min_units"（已與法定下限對齊），再補到 "max_units"；白班資深≥1/3（以人數）
     for d in range(1, nd+1):
         for s in ORDER:
             mn_u, mx_u = demand.get(d,{}).get(s,(0,0))
@@ -410,37 +405,88 @@ def cross_shift_balance_with_units(year, month, id_list, sched, demand, role_map
                     if moved: break
     return sched
 
-# ===== 自動補「每週至少1日O」：優先假日，避免破壞法定最低與白班資深比例與11h =====
-def enforce_weekly_one_off(year, month, sched, demand_df, id_list, role_map, senior_map, junior_map, d_avg, e_avg, n_avg, jr_avg, holiday_set):
+# 假日優先排休：在假日把多餘人力轉為 O（不壓到 min；保白班資深與 11h）
+def prefer_off_on_holidays(year, month, sched, demand_df, id_list, role_map, senior_map, junior_map,
+                           d_avg, e_avg, n_avg, jr_avg, holiday_set):
     nd = days_in_month(year, month)
-
-    # 需求與法定下限（已對齊過）
     demand = {}
-    legal_min = {}
     for r in demand_df.itertuples(index=False):
         d = int(r.day)
-        demand[d] = {"D": (int(r.D_min_units), int(r.D_max_units)), "E": (int(r.E_min_units), int(r.E_max_units)), "N": (int(r.N_min_units), int(r.N_max_units))}
-        legal_min[d] = {"D": int(getattr(r,"D_legal_min_units",0)), "E": int(getattr(r,"E_legal_min_units",0)), "N": int(getattr(r,"N_legal_min_units",0))}
+        demand[d] = {
+            "D": (int(r.D_min_units), int(r.D_max_units)),
+            "E": (int(r.E_min_units), int(r.E_max_units)),
+            "N": (int(r.N_min_units), int(r.N_max_units)),
+        }
 
     def is_hday(d):
         return is_sunday(year, month, d) or (date(year, month, d) in holiday_set)
 
     def units_of(nid, s):
-        return per_person_units(junior_map.get(nid,False), s, d_avg, e_avg, n_avg, jr_avg)
-
-    def actual_units(d, s):
-        return sum(units_of(nid, s) for nid in id_list if sched[nid][d] == s)
+        return per_person_units(junior_map.get(nid, False), s, d_avg, e_avg, n_avg, jr_avg)
 
     def white_senior_ok_if_remove(d, nid):
-        # 若該日該人是白班，移除後仍需滿足資深≥1/3
+        if sched[nid][d] != "D":
+            return True
+        d_people = [x for x in id_list if sched[x][d] == "D" and x != nid]
+        total = len(d_people)
+        if total == 0:
+            return True
+        sen = sum(1 for x in d_people if senior_map.get(x, False))
+        return sen >= ceil(total / 3)
+
+    for d in range(1, nd + 1):
+        if not is_hday(d):  # 只處理假日
+            continue
+        for s in ("D", "E", "N"):
+            mn, _mx = demand.get(d, {}).get(s, (0, 0))
+            def actual_units():
+                return sum(units_of(nid, s) for nid in id_list if sched[nid][d] == s)
+
+            changed = True
+            while changed:
+                changed = False
+                cur_units = actual_units()
+                if cur_units <= mn + 1e-9:
+                    break
+                candidates = [nid for nid in id_list if sched[nid][d] == s]
+                # 單位小（多半是新人）優先改 O；若同單位則 junior 優先
+                candidates.sort(key=lambda nid: (units_of(nid, s), not junior_map.get(nid, False)))
+                moved = False
+                for nid in candidates:
+                    u = units_of(nid, s)
+                    if cur_units - u + 1e-9 < mn:
+                        continue
+                    if not white_senior_ok_if_remove(d, nid):
+                        continue
+                    if not (rest_ok(sched[nid].get(d-1, ""), "O") and rest_ok("O", sched[nid].get(d+1, ""))):
+                        continue
+                    sched[nid][d] = "O"
+                    changed = True
+                    moved = True
+                    break
+                if not moved:
+                    break
+    return sched
+
+# 自動補「每週至少1日O」：優先假日；避免壓到 min；守白班資深與 11h
+def enforce_weekly_one_off(year, month, sched, demand_df, id_list, role_map, senior_map, junior_map, d_avg, e_avg, n_avg, jr_avg, holiday_set):
+    nd = days_in_month(year, month)
+    demand = {}
+    for r in demand_df.itertuples(index=False):
+        d = int(r.day)
+        demand[d] = {"D": (int(r.D_min_units), int(r.D_max_units)),
+                     "E": (int(r.E_min_units), int(r.E_max_units)),
+                     "N": (int(r.N_min_units), int(r.N_max_units))}
+    def is_hday(d): return is_sunday(year, month, d) or (date(year, month, d) in holiday_set)
+    def units_of(nid, s): return per_person_units(junior_map.get(nid,False), s, d_avg, e_avg, n_avg, jr_avg)
+    def actual_units(d, s): return sum(units_of(nid, s) for nid in id_list if sched[nid][d] == s)
+    def white_senior_ok_if_remove(d, nid):
         if sched[nid][d] != "D": return True
         d_people = [x for x in id_list if sched[x][d] == "D" and x != nid]
         total = len(d_people)
         if total == 0: return True
         sen = sum(1 for x in d_people if senior_map.get(x,False))
         return sen >= ceil(total/3)
-
-    # 週區間
     def week_range(w):
         if w==1: return range(1,8)
         if w==2: return range(8,15)
@@ -452,35 +498,28 @@ def enforce_weekly_one_off(year, month, sched, demand_df, id_list, role_map, sen
         for w in [1,2,3,4,5]:
             rng = [d for d in week_range(w) if 1 <= d <= nd]
             if not rng: continue
-            if any(sched[nid][d] == "O" for d in rng):  # 已有O
+            if any(sched[nid][d] == "O" for d in rng):
                 continue
-
-            # 候選日：先週日/假日，再非假日；皆需可行：不破壞當日 min（含法定）；檢查11h；白班資深比例
-            candidates = sorted(rng, key=lambda d: (0 if is_hday(d) else 1,))  # 假日優先
+            # 優先假日
+            candidates = sorted(rng, key=lambda d: (0 if is_hday(d) else 1,))
             picked = False
             for d in candidates:
                 cur = sched[nid][d]
-                if cur == "O": 
+                if cur == "O":
                     picked = True
                     break
-                # 移除該人是否會壓到 min（需求 min 已≥法定）
                 mn = demand.get(d,{}).get(cur,(0,0))[0]
-                act_before = actual_units(d, cur)
-                unit = units_of(nid, cur)
-                if act_before - unit + 1e-9 < mn:  # 會低於min
+                u = units_of(nid, cur)
+                if actual_units(d, cur) - u + 1e-9 < mn:
                     continue
-                # 白班資深比例
                 if not white_senior_ok_if_remove(d, nid):
                     continue
-                # 11小時休息（O 作為休息不違反規則，但確認鄰日變化）
                 if not (rest_ok(sched[nid].get(d-1,""), "O") and rest_ok("O", sched[nid].get(d+1,""))):
                     continue
-                # 通過 → 設為O
                 sched[nid][d] = "O"
                 picked = True
                 break
-
-            # 若假日與最小影響都不行，則維持原狀（將在檢核表顯示違規）
+            # 若都不行則維持，最後在檢核表會標示
     return sched
 
 # ================= Run =================
@@ -488,8 +527,13 @@ def run_schedule():
     sched, demand_map, role_map, id_list, senior_map, junior_map = build_initial_schedule(
         year, month, roles_df, must_off_df, wish_off_df, df_demand, d_avg, e_avg, n_avg, jr_avg
     )
+
     if allow_cross:
         sched = cross_shift_balance_with_units(year, month, id_list, sched, demand_map, role_map, senior_map, junior_map, d_avg, e_avg, n_avg, jr_avg)
+
+    # 假日可休就打 O（先行清空多餘人力）
+    if prefer_off_holiday:
+        sched = prefer_off_on_holidays(year, month, sched, df_demand, id_list, role_map, senior_map, junior_map, d_avg, e_avg, n_avg, jr_avg, holiday_set)
 
     # 自動補「每週至少1日O」
     sched = enforce_weekly_one_off(year, month, sched, df_demand, id_list, role_map, senior_map, junior_map, d_avg, e_avg, n_avg, jr_avg, holiday_set)
@@ -585,3 +629,4 @@ if st.button("🚀 產生班表", type="primary"):
     st.download_button("⬇️ 下載 CSV 每週例假檢核", data=weekly_rest_df.to_csv(index=False).encode("utf-8-sig"), file_name=f"weekly_off_check_{year}-{month:02d}.csv")
 else:
     st.info("請輸入人員（senior/junior/weekly_cap）、必休/想休、總床數與護病比、醫院層級、假日係數與假日日期，然後按「產生班表」。")
+
