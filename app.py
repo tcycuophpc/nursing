@@ -2,162 +2,288 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import calendar
-from io import BytesIO
 
-st.set_page_config(page_title="Nurse Roster (No-A, No openpyxl)", layout="wide")
+st.set_page_config(page_title="Nurse Roster (ID + MustWork/MustOff)", layout="wide")
 
-st.title("🩺 護理師排班工具（不含 A 班，無需 openpyxl）")
-st.caption("支援 ≥20 人、每日人力需求可自訂、員工可填想休日期；輸出 CSV/Excel 皆可，不需 openpyxl。")
+st.title("🩺 護理師排班工具（ID｜不含 A 班｜必上/必休｜每日達標檢視）")
+st.caption("D=出勤、O=休假；依你輸入/上傳的 ID 自動辨識人數，支援必上/必休設定與每日人力達標紅黃綠檢視。")
 
-# ========= Helper functions =========
+# ========= Helpers =========
 def days_in_month(year: int, month: int) -> int:
     return calendar.monthrange(year, month)[1]
 
 def is_sunday(y: int, m: int, d: int) -> bool:
     return datetime(y, m, d).weekday() == 6
 
-# ========= Sidebar 基本設定 =========
-st.sidebar.header("排班設定")
-year = st.sidebar.number_input("年份", 2024, 2100, value=2025, step=1)
-month = st.sidebar.number_input("月份", 1, 12, value=11, step=1)
-days = days_in_month(year, month)
-
-st.sidebar.subheader("每日需求初值（可於主頁修改）")
-default_weekday_need = st.sidebar.number_input("週一至週六 D 人數", 0, 100, 4)
-default_sunday_need = st.sidebar.number_input("週日 D 人數", 0, 100, 5)
-
-st.sidebar.subheader("限制條件")
-max_off = st.sidebar.number_input("每人每月 O 上限", 0, 31, 8)
-
-st.sidebar.subheader("資料上傳（可選）")
-nurses_file = st.sidebar.file_uploader("護理師名單 CSV（欄位：id,name）", type=["csv"])
-prefs_file = st.sidebar.file_uploader("想休日期 CSV（欄位：nurse_id,date）", type=["csv"])
-demand_file = st.sidebar.file_uploader("每日需求 CSV（欄位：day,D_required）", type=["csv"])
-
-# ========= 名單處理 =========
-if nurses_file:
-    nurses = pd.read_csv(nurses_file)
-else:
-    nurses = pd.DataFrame({
-        "id": list(range(1, 21)),
-        "name": [f"{i}號護理師" for i in range(1, 21)]
-    })
-
-# ========= 想休日期處理 =========
-if prefs_file:
-    prefs = pd.read_csv(prefs_file)
-else:
-    prefs = pd.DataFrame(columns=["nurse_id", "date"])
-
-st.subheader("員工想休設定")
-with st.expander("點此展開/編輯想休日期", expanded=False):
-    month_prefix = f"{year}-{month:02d}-"
-    display_prefs = prefs[prefs["date"].astype(str).str.startswith(month_prefix)].copy()
-    edited = st.data_editor(display_prefs, num_rows="dynamic", use_container_width=True)
-    if st.button("✅ 套用想休設定"):
-        other = prefs[~prefs["date"].astype(str).str.startswith(month_prefix)]
-        prefs = pd.concat([other, edited], ignore_index=True)
-        st.success("已更新想休資料。")
-
-pref_map = {int(r.id): set() for r in nurses.itertuples(index=False)}
-for r in prefs.itertuples(index=False):
-    try:
-        dt = pd.to_datetime(r.date)
-        if dt.year == year and dt.month == month:
-            pref_map.setdefault(int(r.nurse_id), set()).add(int(dt.day))
-    except Exception:
-        pass
-
-# ========= 每日需求 =========
-def seed_demand_df(y: int, m: int, wd_need: int, sun_need: int) -> pd.DataFrame:
+def seed_demand_df(y, m, wd_need, sun_need):
     rows = []
     for d in range(1, days_in_month(y, m) + 1):
         need = sun_need if is_sunday(y, m, d) else wd_need
         rows.append({"day": d, "D_required": int(need)})
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=["day", "D_required"])
 
+def parse_id_list(text: str):
+    if not text:
+        return []
+    tokens = [t.strip() for t in text.replace("\n", " ").replace(",", " ").split(" ") if t.strip()]
+    ids = []
+    for t in tokens:
+        try:
+            ids.append(int(t))
+        except:
+            pass
+    return sorted(list(set(ids)))
+
+def build_schedule(year, month, id_list, prefs_df, demand_df, must_work_df, must_off_df, max_off):
+    days = days_in_month(year, month)
+
+    # Preferences map
+    pref_map = {nid: set() for nid in id_list}
+    for r in prefs_df.itertuples(index=False):
+        try:
+            dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
+            if nid in pref_map and dt.year == year and dt.month == month:
+                pref_map[nid].add(int(dt.day))
+        except: pass
+
+    # Must work / must off maps
+    mustW = {nid: set() for nid in id_list}
+    mustO = {nid: set() for nid in id_list}
+    for r in must_work_df.itertuples(index=False):
+        try:
+            dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
+            if nid in mustW and dt.year == year and dt.month == month:
+                mustW[nid].add(int(dt.day))
+        except: pass
+    for r in must_off_df.itertuples(index=False):
+        try:
+            dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
+            if nid in mustO and dt.year == year and dt.month == month:
+                mustO[nid].add(int(dt.day))
+        except: pass
+
+    demand_map = {int(r.day): int(r.D_required) for r in demand_df.itertuples(index=False)}
+
+    # Init schedule
+    schedule = {nid: {d: "" for d in range(1, days + 1)} for nid in id_list}
+
+    # Apply must_off first
+    for nid in id_list:
+        for d in mustO[nid]:
+            if 1 <= d <= days:
+                schedule[nid][d] = "O"
+
+    # Apply preferences (as soft O)
+    for nid in id_list:
+        for d in pref_map[nid]:
+            if 1 <= d <= days and schedule[nid][d] == "":
+                schedule[nid][d] = "O"
+
+    # Per-day assignment (respect must_work as hard D)
+    assigned_D = {nid: 0 for nid in id_list}
+    daily_info = []  # for compliance table
+    for d in range(1, days + 1):
+        req = max(0, int(demand_map.get(d, 0)))
+        # 1) place must-work
+        mw_today = [nid for nid in id_list if d in mustW[nid]]
+        for nid in mw_today:
+            schedule[nid][d] = "D"
+        for nid in mw_today:
+            assigned_D[nid] += 1
+        cur = len(mw_today)
+
+        # 2) fill remaining slots fairly (skip those marked O and already D)
+        if cur < req:
+            candidates = [nid for nid in id_list if schedule[nid][d] != "O" and schedule[nid][d] != "D"]
+            candidates.sort(key=lambda k: (assigned_D[k], k))
+            need_more = req - cur
+            chosen = candidates[:need_more]
+            for nid in chosen:
+                schedule[nid][d] = "D"
+                assigned_D[nid] += 1
+
+        # 3) set blanks to O
+        for nid in id_list:
+            if schedule[nid][d] == "":
+                schedule[nid][d] = "O"
+
+        # collect compliance
+        actual = sum(1 for nid in id_list if schedule[nid][d] == "D")
+        delta = actual - req
+        status = "🟢 達標" if actual == req else ("🟡 超編(+{})".format(delta) if delta > 0 else "🔴 不足({})".format(delta))
+        daily_info.append({"day": d, "D_required": req, "D_actual": actual, "差額": delta, "狀態": status})
+
+    # Feasibility (O cap)
+    def off_count(nid):
+        return sum(1 for k in range(1, days + 1) if schedule[nid][k] == "O")
+
+    total_required_D = sum(max(0, int(demand_map.get(d, 0))) for d in range(1, days + 1))
+    n_staff = len(id_list)
+    avg_off = (n_staff * days - total_required_D) / n_staff if n_staff else 0
+    violations = [(nid, off_count(nid)) for nid in id_list if off_count(nid) > max_off]
+
+    # DataFrames
+    roster_rows = []
+    for nid in id_list:
+        row = {"id": nid}
+        row.update({str(d): schedule[nid][d] for d in range(1, days + 1)})
+        roster_rows.append(row)
+    roster_df = pd.DataFrame(roster_rows).sort_values("id").reset_index(drop=True)
+
+    summary_rows = []
+    for nid in id_list:
+        summary_rows.append({
+            "id": nid,
+            "D天數": sum(1 for d in range(1, days + 1) if schedule[nid][d] == "D"),
+            "O天數": sum(1 for d in range(1, days + 1) if schedule[nid][d] == "O"),
+        })
+    summary_df = pd.DataFrame(summary_rows).sort_values("id").reset_index(drop=True)
+
+    compliance_df = pd.DataFrame(daily_info)
+
+    return roster_df, summary_df, compliance_df, total_required_D, n_staff, avg_off, violations
+
+# ========= Sidebar =========
+with st.sidebar:
+    st.header("排班設定")
+    year = st.number_input("年份", 2024, 2100, value=2025, step=1)
+    month = st.number_input("月份", 1, 12, value=11, step=1)
+    days = days_in_month(year, month)
+
+    st.subheader("每日需求預填（之後可在表格調整）")
+    default_wd = st.number_input("週一至週六 D 人數", 0, 200, 4)
+    default_sun = st.number_input("週日 D 人數", 0, 200, 5)
+
+    st.subheader("限制條件（檢視用）")
+    max_off = st.number_input("每人每月 O 上限", 0, 31, 8)
+
+    st.subheader("資料上傳（可選）")
+    nurses_file = st.file_uploader("護理師名單 CSV（欄位：id,name，可留空）", type=["csv"])
+    prefs_file = st.file_uploader("想休假 CSV（欄位：nurse_id,date）", type=["csv"])
+    demand_file = st.file_uploader("每日需求 CSV（欄位：day,D_required 或 date,D_required）", type=["csv"])
+    must_work_file = st.file_uploader("必上 CSV（欄位：nurse_id,date）", type=["csv"])
+    must_off_file  = st.file_uploader("必休 CSV（欄位：nurse_id,date）", type=["csv"])
+
+# ========= ID 來源設定 =========
+st.subheader("🆔 護理師 ID 清單（可直接貼上）")
+id_text = st.text_area("輸入 ID（逗號/空白/換行分隔；例：101 102 103 或 101,102,103）", value="", height=90)
+
+if nurses_file:
+    nurses_df = pd.read_csv(nurses_file)
+    uploaded_ids = [int(x) for x in pd.Series(nurses_df["id"]).dropna().unique().tolist()]
+else:
+    nurses_df = pd.DataFrame(columns=["id", "name"])
+    uploaded_ids = []
+
+if prefs_file:
+    prefs_df = pd.read_csv(prefs_file)
+else:
+    prefs_df = pd.DataFrame(columns=["nurse_id", "date"])
+
+if must_work_file:
+    must_work_df = pd.read_csv(must_work_file)
+else:
+    must_work_df = pd.DataFrame(columns=["nurse_id", "date"])
+
+if must_off_file:
+    must_off_df = pd.read_csv(must_off_file)
+else:
+    must_off_df = pd.DataFrame(columns=["nurse_id", "date"])
+
+# 需求
 if demand_file:
-    df_demand = pd.read_csv(demand_file)
+    raw = pd.read_csv(demand_file)
+    if "day" in raw.columns and "D_required" in raw.columns:
+        demand_df = raw[["day", "D_required"]].copy()
+    elif "date" in raw.columns and "D_required" in raw.columns:
+        tmp = raw.copy(); tmp["day"] = pd.to_datetime(tmp["date"]).dt.day
+        demand_df = tmp[["day", "D_required"]].copy()
+    else:
+        st.error("每日需求 CSV 欄位需為 'day,D_required' 或 'date,D_required'")
+        st.stop()
 else:
-    df_demand = seed_demand_df(year, month, default_weekday_need, default_sunday_need)
+    demand_df = seed_demand_df(year, month, default_wd, default_sun)
 
-st.subheader("每日人力需求（可修改）")
-df_demand = st.data_editor(df_demand, use_container_width=True, height=350)
-demand_map = {int(r.day): int(r.D_required) for r in df_demand.itertuples(index=False)}
+# 整合 ID：手動 + 名單 + 想休 + 必上 + 必休
+ids_manual = parse_id_list(id_text)
+ids_from_prefs = [int(x) for x in pd.Series(prefs_df["nurse_id"]).dropna().unique().tolist()] if "nurse_id" in prefs_df.columns else []
+ids_from_mw = [int(x) for x in pd.Series(must_work_df["nurse_id"]).dropna().unique().tolist()] if "nurse_id" in must_work_df.columns else []
+ids_from_mo = [int(x) for x in pd.Series(must_off_df["nurse_id"]).dropna().unique().tolist()] if "nurse_id" in must_off_df.columns else []
 
-# ========= 排班邏輯（D/O） =========
-schedule = {int(r.id): {d: "" for d in range(1, days + 1)} for r in nurses.itertuples(index=False)}
+id_list = sorted(list(set(ids_manual) | set(uploaded_ids) | set(ids_from_prefs) | set(ids_from_mw) | set(ids_from_mo)))
+if len(id_list) == 0:
+    id_list = list(range(1, 21))  # fallback 範例
 
-# 想休日先設 O
-for nid in schedule.keys():
-    for d in pref_map.get(nid, set()):
-        if 1 <= d <= days:
-            schedule[nid][d] = "O"
+st.info(f"將以 **{len(id_list)} 位**護理師進行排班。ID：{', '.join(map(str, id_list[:50]))}{' ...' if len(id_list)>50 else ''}")
 
-assigned_D = {nid: 0 for nid in schedule.keys()}
+# ========= 可編輯表格：每日需求 / 想休 / 必上 / 必休 =========
+st.subheader("📋 每日人力需求（可編輯）")
+demand_df = demand_df.sort_values("day").reset_index(drop=True)
+demand_df["day"] = demand_df["day"].astype(int)
+demand_df["D_required"] = demand_df["D_required"].astype(int)
+demand_df = st.data_editor(
+    demand_df,
+    use_container_width=True,
+    num_rows="fixed",
+    column_config={
+        "day": st.column_config.NumberColumn("day", min_value=1, max_value=days, step=1),
+        "D_required": st.column_config.NumberColumn("D_required", min_value=0, max_value=200, step=1),
+    },
+    height=320
+)
 
-# 逐日填入 D
-for d in range(1, days + 1):
-    req = demand_map.get(d, 0)
-    candidates = [nid for nid in schedule.keys() if schedule[nid][d] != "O"]
-    candidates.sort(key=lambda nid: (assigned_D[nid], nid))
-    chosen = candidates[:req]
-    for nid in chosen:
-        schedule[nid][d] = "D"
-        assigned_D[nid] += 1
-    for nid in schedule.keys():
-        if schedule[nid][d] == "":
-            schedule[nid][d] = "O"
+st.subheader("📝 員工想休（本月）")
+month_prefix = f"{year}-{month:02d}-"
+show_prefs = prefs_df[prefs_df["date"].astype(str).str.startswith(month_prefix)].copy()
+prefs_edit = st.data_editor(show_prefs, num_rows="dynamic", use_container_width=True, height=260, key="prefs_edit")
 
-# ========= 統計與可行性檢查 =========
-def off_count(nid):
-    return sum(1 for d in range(1, days + 1) if schedule[nid][d] == "O")
+st.subheader("✅ 必上（硬性出勤）")
+mw_show = must_work_df[must_work_df["date"].astype(str).str.startswith(month_prefix)] if "date" in must_work_df.columns else must_work_df
+mw_edit = st.data_editor(mw_show, num_rows="dynamic", use_container_width=True, height=200, key="mw_edit",
+                         help="欄位：nurse_id（整數）、date（YYYY-MM-DD）。當日將強制安排 D。")
 
-total_required_D = sum(demand_map.values())
-n_staff = len(schedule.keys())
-avg_off = (n_staff * days - total_required_D) / n_staff
-violations = [(nid, off_count(nid)) for nid in schedule.keys() if off_count(nid) > max_off]
+st.subheader("⛔ 必休（硬性休假）")
+mo_show = must_off_df[must_off_df["date"].astype(str).str.startswith(month_prefix)] if "date" in must_off_df.columns else must_off_df
+mo_edit = st.data_editor(mo_show, num_rows="dynamic", use_container_width=True, height=200, key="mo_edit",
+                         help="欄位：nurse_id（整數）、date（YYYY-MM-DD）。當日將強制安排 O。")
 
-# ========= 結果輸出 =========
-id2name = {int(r.id): r.name for r in nurses.itertuples(index=False)}
-roster_df = pd.DataFrame([
-    {"姓名": id2name[nid], **{str(d): schedule[nid][d] for d in range(1, days + 1)}}
-    for nid in schedule.keys()
-])
-summary_df = pd.DataFrame([
-    {"姓名": id2name[nid], "D天數": sum(v == "D" for v in schedule[nid].values()),
-     "O天數": sum(v == "O" for v in schedule[nid].values())}
-    for nid in schedule.keys()
-])
+# ========= 產生班表 =========
+if st.button("🚀 產生班表"):
+    roster_df, summary_df, compliance_df, total_required_D, n_staff, avg_off, violations = build_schedule(
+        year, month, id_list, prefs_edit, demand_df, mw_edit, mo_edit, max_off
+    )
 
-st.subheader(f"📅 {year}-{month:02d} 班表")
-st.dataframe(roster_df, use_container_width=True, height=500)
+    st.subheader(f"📅 {year}-{month:02d} 班表（ID）")
+    st.dataframe(roster_df, use_container_width=True, height=520)
 
-st.subheader("統計摘要")
-st.dataframe(summary_df, use_container_width=True, height=300)
+    st.subheader("統計摘要")
+    st.dataframe(summary_df, use_container_width=True, height=320)
 
-st.markdown(f"### 📊 可行性檢視")
-st.info(f"本月需 D 班次：**{total_required_D}**；人數：**{n_staff}**；理論平均 O/人：**{avg_off:.2f} 天**。")
-if violations:
-    st.warning(f"有 {len(violations)} 位人員 O 超過上限（> {max_off} 天）。")
+    st.subheader("📊 每日人力達標檢視")
+    st.dataframe(compliance_df, use_container_width=True, height=360)
+
+    st.markdown("### 可行性檢視")
+    st.info(f"本月需 D 班次：**{total_required_D}**；參與人數：**{n_staff}**；理論平均 O/人：**{avg_off:.2f} 天**。")
+    if violations:
+        st.warning(f"有 {len(violations)} 位 O 超過上限（> {max_off} 天）。")
+    else:
+        st.success("目前無 O 上限違規。")
+
+    # Downloads
+    st.download_button("⬇️ 下載 CSV 班表", data=roster_df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"roster_{year}-{month:02d}_by_id.csv")
+    st.download_button("⬇️ 下載 CSV 統計", data=summary_df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"summary_{year}-{month:02d}_by_id.csv")
+    st.download_button("⬇️ 下載 CSV 每日達標", data=compliance_df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"compliance_{year}-{month:02d}.csv")
 else:
-    st.success("目前無 O 上限違規。")
-
-# ========= 下載 =========
-csv_bytes = roster_df.to_csv(index=False).encode("utf-8-sig")
-st.download_button("⬇️ 下載 CSV", data=csv_bytes, file_name=f"roster_{year}-{month:02d}.csv")
-
-excel_sim = BytesIO()
-summary_csv = summary_df.to_csv(index=False)
-excel_sim.write(summary_csv.encode("utf-8-sig"))
-st.download_button("⬇️ 下載 Excel 模擬檔（實際為 CSV 格式）", data=excel_sim.getvalue(),
-                   file_name=f"roster_{year}-{month:02d}_summary.xlsx")
+    st.info("請先確認：ID 清單、每日需求表、想休/必上/必休，再按「產生班表」。")
 
 st.markdown("""
 ---
-**使用說明**
-1. 側邊欄設定年月與人力預設需求（週日與平日）。
-2. 可上傳或在頁面直接編輯每日需求、想休日期、護理師名單。
-3. 系統自動生成班表並提供下載。
-4. 此版本完全不依賴 openpyxl，可在任何環境執行。
+**說明**
+- 系統整合 ID 來源：手動輸入、名單檔、想休檔、必上/必休檔（聯集）。  
+- 「必上」會先填入 D，再補足當日需求；「必休」會先鎖 O。  
+- 「每日人力達標檢視」：🟢達標、🟡超編、🔴不足。  
+- 僅 D/O，無 A 班與 E/N 細班；若人力遠大於需求，理論平均 O 會高，可能超過你的 O 上限。
 """)
