@@ -3,10 +3,10 @@ import pandas as pd
 from datetime import datetime
 import calendar
 
-st.set_page_config(page_title="Nurse Roster (3 Shifts, Equal Off)", layout="wide")
+st.set_page_config(page_title="Nurse Roster (3 Shifts, Fixed Role, Equal Off)", layout="wide")
 
-st.title("🩺 護理師排班工具｜三班制（白D／小夜E／大夜N）＋ 等量休假")
-st.caption("輸入/上傳 ID、每日 D/E/N 需求與想休後，按下按鈕產生班表。系統會嘗試讓每人當月休假(O)天數一致，並遵守 11 小時休息。")
+st.title("🩺 三班制排班｜固定班別（不可跨班）＋等量休假")
+st.caption("每位人員固定 D/E/N 班別；每日三班需求可自訂；想休(O)優先；同班別內做等量休假調整；符合 11 小時休息。")
 
 # ===== Helpers =====
 def days_in_month(year: int, month: int) -> int:
@@ -22,7 +22,7 @@ def week_index(day: int) -> int:
     if day <= 28: return 4
     return 5
 
-# 定義三班的起迄時間（簡化版，用於跨日 11h 休息檢查）
+# 三班時間（跨日休息檢查用；固定單班者天然 >= 11h）
 SHIFT = {
     "D": {"start": 8,  "end": 16, "hours": 8},
     "E": {"start": 16, "end": 24, "hours": 8},
@@ -32,8 +32,6 @@ SHIFT = {
 ORDER = ["D", "E", "N"]
 
 def rest_ok(prev_code: str, next_code: str) -> bool:
-    """跨日休息：檢查前一日班別到下一日班別是否 >= 11 小時。
-       O 視為不限制；同日只排一班。"""
     if prev_code in (None, "", "O") or next_code in (None, "", "O"):
         return True
     s1, e1 = SHIFT[prev_code]["start"], SHIFT[prev_code]["end"]
@@ -42,208 +40,180 @@ def rest_ok(prev_code: str, next_code: str) -> bool:
     if rest < 0: rest += 24
     return rest >= 11
 
-def seed_demand_df(y, m, wd_need_D, sun_need_D, wd_need_E, sun_need_E, wd_need_N, sun_need_N):
+def seed_demand_df(y, m, wdD, sunD, wdE, sunE, wdN, sunN):
     rows = []
-    for d in range(1, days_in_month(y, m) + 1):
-        is_sun = is_sunday(y, m, d)
+    for d in range(1, days_in_month(y, m)+1):
+        sun = is_sunday(y, m, d)
         rows.append({
             "day": d,
-            "D_required": int(sun_need_D if is_sun else wd_need_D),
-            "E_required": int(sun_need_E if is_sun else wd_need_E),
-            "N_required": int(sun_need_N if is_sun else wd_need_N),
+            "D_required": int(sunD if sun else wdD),
+            "E_required": int(sunE if sun else wdE),
+            "N_required": int(sunN if sun else wdN),
         })
     return pd.DataFrame(rows, columns=["day","D_required","E_required","N_required"])
 
 def parse_id_list(text: str):
-    if not text:
-        return []
-    tokens = [t.strip() for t in text.replace("\n", " ").replace(",", " ").split(" ") if t.strip()]
+    if not text: return []
+    tokens = [t.strip() for t in text.replace("\n"," ").replace(","," ").split(" ") if t.strip()]
     ids = []
     for t in tokens:
         try: ids.append(int(t))
         except: pass
     return sorted(list(set(ids)))
 
-# ===== Core scheduling =====
-def build_initial_schedule(year, month, id_list, prefs_df, demand_df):
-    """1) 先以想休標 O；2) 逐日逐班補足需求，公平分配；3) 其他補 O。"""
+# ===== Build initial schedule (respect fixed shift role) =====
+def build_initial_schedule(year, month, roster_roles_df, prefs_df, demand_df):
+    """每位人員固定班別；先依偏好標 O，再在各自班別內公平補足需求，剩餘補 O。"""
     days = days_in_month(year, month)
-    # 偏好 map：{id: set(day)}
+
+    # 1) 角色表：id -> role (D/E/N)
+    role_map = {}
+    for r in roster_roles_df.itertuples(index=False):
+        try:
+            nid = int(r.id); role = str(r.shift).strip().upper()
+            if role in ("D","E","N"): role_map[nid] = role
+        except: pass
+    id_list = sorted(role_map.keys())
+
+    # 2) 偏好 map
     pref_map = {nid: set() for nid in id_list}
     for r in prefs_df.itertuples(index=False):
         try:
             dt = pd.to_datetime(r.date); nid = int(r.nurse_id)
             if nid in pref_map and dt.year == year and dt.month == month:
                 pref_map[nid].add(int(dt.day))
-        except:
-            pass
+        except: pass
 
-    # 需求 map：day -> {D,E,N}
+    # 3) 需求 map
     demand = {}
     for r in demand_df.itertuples(index=False):
-        demand[int(r.day)] = {
-            "D": int(r.D_required),
-            "E": int(r.E_required),
-            "N": int(r.N_required),
-        }
+        demand[int(r.day)] = {"D": int(r.D_required), "E": int(r.E_required), "N": int(r.N_required)}
 
-    # 初始化：每人每天空字串
+    # 4) 初始化
     sched = {nid: {d: "" for d in range(1, days+1)} for nid in id_list}
 
-    # 先放想休 O
+    # 先放 O（偏好）
     for nid in id_list:
         for d in pref_map[nid]:
             if 1 <= d <= days:
                 sched[nid][d] = "O"
 
-    # 計數器：每人各班被分配數量（為公平分配）
-    count_shift = {nid: {"D":0,"E":0,"N":0} for nid in id_list}
+    # 計數器：各自角色的工作次數，公平分配
+    role_count = {nid: 0 for nid in id_list}
 
-    # 逐日逐班分配
+    # 5) 逐日補足各班需求（人員只能上自己的班）
+    shortage_log = []
     for d in range(1, days+1):
-        # 按班別順序，將需求補足
         for s in ORDER:
-            req = demand.get(d, {}).get(s, 0)
-            # 候選：當天不是 O、尚未有班別的人（避免同日多班），且跨日休息 OK
+            req = demand[d][s]
+            # 候選：此班別的成員、當天未排、不是 O、跨日休息OK
             candidates = []
             for nid in id_list:
-                if sched[nid][d] != "":  # 已有 O 或已安排其他班
+                if role_map[nid] != s: continue
+                if sched[nid][d] != "":  # 已 O 或已排
                     continue
                 prev_code = sched[nid].get(d-1, "")
+                # 因為不可跨班，若前一天也是本班或 O，休息一定OK；保險檢查:
                 if rest_ok(prev_code, s):
                     candidates.append(nid)
-            # 按「該班次被分配較少、總量較少、ID」排序，求公平
-            candidates.sort(key=lambda k: (count_shift[k][s],
-                                           count_shift[k]["D"]+count_shift[k]["E"]+count_shift[k]["N"],
-                                           k))
+            candidates.sort(key=lambda k: (role_count[k], k))
             chosen = candidates[:req]
             for nid in chosen:
                 sched[nid][d] = s
-                count_shift[nid][s] += 1
+                role_count[nid] += 1
 
-        # 其餘空白補 O（保持每人每日最多一班）
+            # 記錄不足/超編
+            actual = sum(1 for nid in id_list if sched[nid][d] == s)
+            if actual < req:
+                shortage_log.append((d, s, req-actual))
+
+        # 其餘補 O
         for nid in id_list:
             if sched[nid][d] == "":
                 sched[nid][d] = "O"
 
-    return sched, demand
+    return sched, demand, role_map, shortage_log
 
-def weekly_rest_ok(sched, nid, days):
-    """檢查每週至少一個 O（軟性目標，不作硬阻擋，調整時盡量維持）"""
-    for w, rng in enumerate([range(1,8), range(8,15), range(15,22), range(22,29), range(29, days+1)], start=1):
+def weekly_rest_soft_guard(sched, nid, days):
+    """軟性：盡量保留每週至少一天 O"""
+    for rng in [range(1,8), range(8,15), range(15,22), range(22,29), range(29, days+1)]:
         if sum(1 for dd in rng if sched[nid][dd] == "O") == 0:
             return False
     return True
 
-def equalize_off_days(year, month, id_list, sched, demand):
-    """嘗試讓每人 O 天數一樣：計算目標 O（四捨五入的平均），
-       對於 O 過多的人，嘗試與同日某班的人做交換（對方 O+1、自己 O-1），
-       不破壞需求、不破壞 11h 休息，盡量維持每週至少一休。"""
+# ===== Equalize off days within each shift pool =====
+def equalize_off_by_pool(year, month, id_list, sched, demand, role_map):
+    """在每個班別池內（D池、E池、N池）讓 O 盡量相等；不跨班。"""
     days = days_in_month(year, month)
 
-    def off_count(nid):
-        return sum(1 for d in range(1, days+1) if sched[nid][d] == "O")
+    def off_count(nid): return sum(1 for d in range(1, days+1) if sched[nid][d] == "O")
 
-    total_required = sum(demand.get(d, {}).get("D",0) +
-                         demand.get(d, {}).get("E",0) +
-                         demand.get(d, {}).get("N",0)
-                         for d in range(1, days+1))
-    n = len(id_list)
-    avg_off = (n*days - total_required) / n if n else 0
-    target_off = int(round(avg_off))  # 以四捨五入平均 O 當目標
+    results = {}
+    for s in ORDER:
+        pool = [nid for nid in id_list if role_map[nid] == s]
+        if not pool:
+            results[s] = 0
+            continue
 
-    # 計算每日各班實際已排人數（用來保持需求不變）
-    def day_counts(d):
-        return {
-            "D": sum(1 for nid in id_list if sched[nid][d] == "D"),
-            "E": sum(1 for nid in id_list if sched[nid][d] == "E"),
-            "N": sum(1 for nid in id_list if sched[nid][d] == "N"),
-        }
+        # 該班總需求
+        total_req_s = sum(demand.get(d, {}).get(s, 0) for d in range(1, days+1))
+        n = len(pool)
+        avg_off = (n*days - total_req_s) / n if n else 0
+        target_off = int(round(avg_off))
 
-    # 先快速退出條件
-    offs = {nid: off_count(nid) for nid in id_list}
-    if min(offs.values()) == max(offs.values()) == target_off:
-        return sched, target_off
+        # 若已經全等，略過
+        offs = {nid: off_count(nid) for nid in pool}
+        if min(offs.values(), default=0) == max(offs.values(), default=0) == target_off:
+            results[s] = target_off
+            continue
 
-    # 迭代嘗試交換（有限次避免無限循環）
-    for _ in range(5000):
-        # 找到 O 過多的人與 O 過少的人
-        over_list  = [nid for nid in id_list if off_count(nid) > target_off]
-        under_list = [nid for nid in id_list if off_count(nid) < target_off]
-        if not over_list or not under_list:
-            break
+        # 迭代同班別池內交換：把 O 過多者在某日的 O 換成本班工作，與 O 過少者在同日同班對調
+        for _ in range(4000):
+            over = [nid for nid in pool if off_count(nid) > target_off]
+            under = [nid for nid in pool if off_count(nid) < target_off]
+            if not over or not under:
+                break
 
-        over_list.sort(key=lambda nid: (-off_count(nid), nid))
-        under_list.sort(key=lambda nid: (off_count(nid), nid))
+            over.sort(key=lambda nid: (-off_count(nid), nid))
+            under.sort(key=lambda nid: (off_count(nid), nid))
+            moved = False
 
-        moved = False
-        for nid_over in over_list:
-            # 過多的人，找他 O 的某一天，嘗試接手別人的班（互換）
-            for d in range(1, days+1):
-                if sched[nid_over][d] != "O":
-                    continue
-
-                # 嘗試三個班別
-                for s in ORDER:
-                    # 當天 s 班實際人數、需求
-                    cnt = day_counts(d)
+            for nid_over in over:
+                # 尋找他的一天 O，嘗試與當天本班的某位 under 交換
+                for d in range(1, days+1):
+                    if sched[nid_over][d] != "O":
+                        continue
+                    # 當天本班需求數
                     req = demand.get(d, {}).get(s, 0)
-                    # 我們不增加/減少日需求，僅交換：找目前在該班的某人 nid_under
-                    candidates = [nid for nid in under_list if sched[nid][d] == s]
-                    # 為了公平，少休的優先釋出
-                    candidates.sort(key=lambda x: (off_count(x), x))
-
+                    # 找在當天本班上班、屬於 under 的人
+                    candidates = [nid for nid in under if sched[nid][d] == s]
+                    candidates.sort(key=lambda nid: (off_count(nid), nid))
+                    # 休息檢查
+                    prev_over = sched[nid_over].get(d-1, "O")
+                    next_over = sched[nid_over].get(d+1, "O")
+                    if not (rest_ok(prev_over, s) and rest_ok(s, next_over)):
+                        continue
+                    # 嘗試交換
                     for nid_under in candidates:
-                        # 交換條件：雙方休息間隔合法、週休不被破壞
-                        prev_over = sched[nid_over].get(d-1, "")
-                        next_over = sched[nid_over].get(d+1, "")
-                        prev_under = sched[nid_under].get(d-1, "")
-                        next_under = sched[nid_under].get(d+1, "")
-
-                        if not rest_ok(prev_over, s) or not rest_ok(s, next_over):
-                            continue
-                        # 對方被換成 O，要檢查他/她是否還保有每週至少一休
-                        old_under_code = s
-                        # 暫時修改檢查週休
-                        old_under_d = sched[nid_under][d]
+                        # 將 under 改為 O 是否破壞他每週至少一休？
+                        old = sched[nid_under][d]
                         sched[nid_under][d] = "O"
-                        ok_week = weekly_rest_ok(sched, nid_under, days)
-                        sched[nid_under][d] = old_under_d
-                        if not ok_week:
+                        ok_week = weekly_rest_soft_guard(sched, nid_under, days)
+                        sched[nid_under][d] = old
+                        if not ok_week: 
                             continue
-                        # O 過多者從 O -> s，也要確保每週至少一休仍可能達成（寬鬆：不把該週唯一 O 用光）
-                        w = week_index(d)
-                        def week_offs(nid, w):
-                            if w==1: rng = range(1,8)
-                            elif w==2: rng = range(8,15)
-                            elif w==3: rng = range(15,22)
-                            elif w==4: rng = range(22,29)
-                            else: rng = range(29, days+1)
-                            return sum(1 for dd in rng if sched[nid][dd] == "O")
-                        if week_offs(nid_over, w) <= 1:
-                            continue
-
-                        # 通過檢查，做交換：over 接 s，under 改 O
+                        # 交換
                         sched[nid_over][d] = s
                         sched[nid_under][d] = "O"
                         moved = True
                         break
-                    if moved:
-                        break
-                if moved:
-                    break
-            if moved:
-                break
+                    if moved: break
+                if moved: break
+            if not moved: break
 
-        if not moved:
-            break
+        results[s] = target_off
 
-        # 若已達到目標，提前結束
-        offs = {nid: sum(1 for d in range(1, days+1) if sched[nid][d] == "O") for nid in id_list}
-        if min(offs.values()) == max(offs.values()) == target_off:
-            break
-
-    return sched, target_off
+    return sched, results
 
 # ===== UI: sidebar =====
 with st.sidebar:
@@ -253,46 +223,47 @@ with st.sidebar:
     days = days_in_month(year, month)
 
     st.subheader("每日需求預填（可在主頁表格調整）")
-    wd_D = st.number_input("平日：白班(D)", 0, 200, 2)
+    wd_D = st.number_input("平日：白(D)", 0, 200, 2)
     wd_E = st.number_input("平日：小夜(E)", 0, 200, 1)
     wd_N = st.number_input("平日：大夜(N)", 0, 200, 1)
-    sun_D = st.number_input("週日：白班(D)", 0, 200, 3)
+    sun_D = st.number_input("週日：白(D)", 0, 200, 3)
     sun_E = st.number_input("週日：小夜(E)", 0, 200, 1)
     sun_N = st.number_input("週日：大夜(N)", 0, 200, 1)
 
     st.subheader("資料上傳（可選）")
-    nurses_file = st.file_uploader("名單 CSV（欄位：id,name，可留空）", type=["csv"])
-    prefs_file  = st.file_uploader("想休 CSV（欄位：nurse_id,date，YYYY-MM-DD）", type=["csv"])
-    demand_file = st.file_uploader("每日需求 CSV（欄位：day,D_required,E_required,N_required 或含 date 欄位）", type=["csv"])
+    roles_file = st.file_uploader("人員班別 CSV（欄位：id,shift；shift ∈ {D,E,N}）", type=["csv"])
+    prefs_file = st.file_uploader("想休 CSV（欄位：nurse_id,date，YYYY-MM-DD）", type=["csv"])
+    demand_file = st.file_uploader("每日需求 CSV（欄位：day,D_required,E_required,N_required 或含 date 欄）", type=["csv"])
 
-# ===== ID 來源 =====
-st.subheader("🆔 護理師 ID 清單（可直接貼上）")
-id_text = st.text_area("輸入 ID（逗號/空白/換行分隔；例：101 102 103 或 101,102,103）", height=90)
-
-if nurses_file:
-    nurses_df = pd.read_csv(nurses_file)
-    uploaded_ids = [int(x) for x in pd.Series(nurses_df["id"]).dropna().unique().tolist()]
+# ===== 人員班別資料 =====
+st.subheader("👥 人員班別設定（每人固定班別，不可跨班）")
+if roles_file:
+    roles_df = pd.read_csv(roles_file)
 else:
-    nurses_df = pd.DataFrame(columns=["id","name"])
-    uploaded_ids = []
+    # 提供可編輯範例：10 位，預設 D5/E3/N2
+    roles_df = pd.DataFrame({
+        "id": list(range(101, 111)),
+        "shift": ["D"]*5 + ["E"]*3 + ["N"]*2
+    })
+roles_df = st.data_editor(
+    roles_df, use_container_width=True, num_rows="dynamic",
+    height=240
+)
+# 只保留合法 shift
+roles_df["shift"] = roles_df["shift"].astype(str).str.upper().map(lambda x: x if x in ("D","E","N") else "")
+roles_df = roles_df[roles_df["shift"].isin(["D","E","N"])].dropna(subset=["id"])
 
-ids_manual = parse_id_list(id_text)
-
-# 想休
+# ===== 想休資料 =====
+st.subheader("📝 員工想休（本月）")
 if prefs_file:
     prefs_df = pd.read_csv(prefs_file)
 else:
-    prefs_df = pd.DataFrame(columns=["nurse_id","date"])
+    prefs_df = pd.DataFrame(columns=["nurse_id", "date"])
+month_prefix = f"{year}-{month:02d}-"
+show_prefs = prefs_df[prefs_df["date"].astype(str).str.startswith(month_prefix)].copy()
+prefs_edit = st.data_editor(show_prefs, use_container_width=True, num_rows="dynamic", height=260, key="prefs_edit")
 
-ids_from_prefs = [int(x) for x in pd.Series(prefs_df["nurse_id"]).dropna().unique().tolist()] if "nurse_id" in prefs_df.columns else []
-
-id_list = sorted(list(set(ids_manual) | set(uploaded_ids) | set(ids_from_prefs)))
-if len(id_list) == 0:
-    id_list = list(range(1, 21))  # fallback 示範
-
-st.info(f"將以 **{len(id_list)} 位**護理師進行排班。ID：{', '.join(map(str, id_list[:50]))}{' ...' if len(id_list)>50 else ''}")
-
-# ===== 每日需求表 =====
+# ===== 每日三班需求 =====
 st.subheader("📋 每日三班需求（可編輯）")
 if demand_file:
     raw = pd.read_csv(demand_file)
@@ -323,42 +294,35 @@ df_demand = st.data_editor(
     height=340
 )
 
-# ===== 想休（可編輯） =====
-st.subheader("📝 員工想休（本月）")
-month_prefix = f"{year}-{month:02d}-"
-show_prefs = prefs_df[prefs_df["date"].astype(str).str.startswith(month_prefix)].copy()
-prefs_edit = st.data_editor(show_prefs, num_rows="dynamic", use_container_width=True, height=260, key="prefs_edit")
-
 # ===== 產生班表 =====
-if st.button("🚀 產生班表（三班 + 等量休假）"):
-    # 初排
-    sched, demand_map = build_initial_schedule(year, month, id_list, prefs_edit, df_demand)
+if st.button("🚀 產生班表（固定班別 + 等量休假）"):
+    sched, demand_map, role_map, shortage_log = build_initial_schedule(year, month, roles_df, prefs_edit, df_demand)
 
-    # 等量休假調整
-    sched_equal, target_off = equalize_off_days(year, month, id_list, sched, demand_map)
+    id_list = sorted(role_map.keys())
+    sched_equal, target_off_by_pool = equalize_off_by_pool(year, month, id_list, sched, demand_map, role_map)
 
-    # 輸出表格
     days = days_in_month(year, month)
+    # 班表輸出
     roster_rows = []
     for nid in id_list:
-        row = {"id": nid}
+        row = {"id": nid, "shift": role_map[nid]}
         row.update({str(d): sched_equal[nid][d] for d in range(1, days+1)})
         roster_rows.append(row)
-    roster_df = pd.DataFrame(roster_rows).sort_values("id").reset_index(drop=True)
+    roster_df = pd.DataFrame(roster_rows).sort_values(["shift","id"]).reset_index(drop=True)
 
     # 統計摘要
-    def count_code(nid, code):
-        return sum(1 for d in range(1, days+1) if sched_equal[nid][d] == code)
+    def count_code(nid, code): return sum(1 for d in range(1, days+1) if sched_equal[nid][d] == code)
     summary_rows = []
     for nid in id_list:
         summary_rows.append({
             "id": nid,
+            "shift": role_map[nid],
             "D天數": count_code(nid, "D"),
             "E天數": count_code(nid, "E"),
             "N天數": count_code(nid, "N"),
             "O天數": count_code(nid, "O"),
         })
-    summary_df = pd.DataFrame(summary_rows).sort_values("id").reset_index(drop=True)
+    summary_df = pd.DataFrame(summary_rows).sort_values(["shift","id"]).reset_index(drop=True)
 
     # 每日達標檢視
     comp_rows = []
@@ -376,31 +340,39 @@ if st.button("🚀 產生班表（三班 + 等量休假）"):
     compliance_df = pd.DataFrame(comp_rows)
 
     # 顯示
-    st.subheader(f"📅 {year}-{month:02d} 班表（ID）")
+    st.subheader(f"📅 {year}-{month:02d} 班表（ID｜固定班別）")
     st.dataframe(roster_df, use_container_width=True, height=520)
 
     st.subheader("統計摘要")
     st.dataframe(summary_df, use_container_width=True, height=320)
-    st.info(f"目標等量休假天數（四捨五入平均）：**{target_off} 天／人**")
 
     st.subheader("📊 每日達標檢視")
     st.dataframe(compliance_df, use_container_width=True, height=360)
 
+    # 目標 O 天數（各班別）
+    msg = "、".join([f"{s} 班目標 O：{target_off_by_pool.get(s,0)} 天/人" for s in ORDER])
+    st.info(f"等量休假目標（以各班別池內平均四捨五入）：{msg}")
+
+    # 不足提示（若因同班人數不足導致某些日無法達標）
+    if shortage_log:
+        lines = [f"{d}日 {s} 班缺 {k} 人" for (d,s,k) in shortage_log[:50]]
+        st.warning("⚠️ 部分日/班人力不足（固定班別限制下無法補齊）：\n- " + "\n- ".join(lines) + ("\n..." if len(shortage_log)>50 else ""))
+
     # 下載
     st.download_button("⬇️ 下載 CSV 班表", data=roster_df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"roster_{year}-{month:02d}_3shifts_equal_off.csv")
+                       file_name=f"roster_{year}-{month:02d}_fixedrole_equaloff.csv")
     st.download_button("⬇️ 下載 CSV 統計", data=summary_df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"summary_{year}-{month:02d}_3shifts_equal_off.csv")
+                       file_name=f"summary_{year}-{month:02d}_fixedrole_equaloff.csv")
     st.download_button("⬇️ 下載 CSV 每日達標", data=compliance_df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"compliance_{year}-{month:02d}_3shifts_equal_off.csv")
+                       file_name=f"compliance_{year}-{month:02d}_fixedrole_equaloff.csv")
 else:
-    st.info("請先確認：ID、每日三班需求與想休，然後按「產生班表（三班 + 等量休假）」。")
+    st.info("請確認：人員班別表（id,shift）、每日三班需求、想休(O)，再按「產生班表」。")
 
 st.markdown("""
 ---
-**說明 & 限制**
-- 先以想休(O)標記，再公平補足每日 D/E/N 需求；之後進行「等量休假」交換：讓 O 過多的人在不破壞需求與 11 小時休息的前提下，與 O 過少的人**同日同班互換**，以拉齊 O 天數。
-- 週休：交換時盡量維持每週至少一休（若該週只剩 1 天 O，將避免動到那天）。
-- 若需求配置本身就很緊或偏好過多，可能無法完全達到「人人 O 完全相同」，系統會盡量接近目標值。
-- 如需「某人某日**必上**某班」功能、或「最大連續夜班數」等更嚴格規則，也可再加強（會讓演算法更偏向整數規劃/CP-SAT）。
+**規則與說明**
+- 每位人員固定班別（D/E/N），不可跨班分配。
+- 想休 (O) 會先標記，再在各自班別內公平補足每日需求；剩餘補 O。
+- 「等量休假」只在同班別池內做交換，不跨班；確保不改變每日各班人數，也盡量保留每週至少一休。
+- 若某班別在某些日子本來就人力不足，系統會標出不足清單與每日達標表（紅/黃/綠）。
 """)
