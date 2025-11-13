@@ -153,14 +153,20 @@ def seed_demand_from_beds(y, m, total_beds,
         })
     return pd.DataFrame(rows)
 
-# =============== 能力單位：新人不算人力 ===============
+# =============== 能力單位：新人護病比 1:4，列入人力 ===============
 def per_person_units(is_junior: bool, shift_code: str,
                      d_avg: float, e_avg: float, n_avg: float,
-                     jr_avg: float = 4.5):
-    # 新人完全不列入人力：0 單位
-    if is_junior:
-        return 0.0
-    return 1.0
+                     jr_ratio: float = 4.0):
+    """
+    正式人員：1 單位（依你輸入護病比計算需求）
+    新人：護病比固定 1:4，能力 = 4 / 該班別平均護病比（<1，表示需要較多人）
+    """
+    if not is_junior:
+        return 1.0
+    base = {"D": d_avg, "E": e_avg, "N": n_avg}.get(shift_code, d_avg)
+    if base <= 0:
+        return 1.0
+    return jr_ratio / base
 
 # =============== Sidebar 登入 / 自助註冊 ===============
 def sidebar_auth():
@@ -253,7 +259,7 @@ n_avg = (n_ratio_min + n_ratio_max) / 2.0
 
 role = st.session_state.get("role", None)
 
-# =============== 員工端畫面 ===============
+# =============== 員工端畫面（必休用選取，其餘自動變想休） ===============
 if role == "user":
     users = load_users()
     me = users[users["employee_id"] == st.session_state["acct"]].iloc[0]
@@ -278,58 +284,51 @@ if role == "user":
 
     must_set = to_dateset(my[my["type"]=="must"])
 
-    st.subheader("⛔ 必休（請填日期：YYYY-MM-DD）")
-    must_df_view = pd.DataFrame({
-        "date": [f"{year}-{month:02d}-{d:02d}" for d in sorted(must_set)]
-    })
-    must_df_view = st.data_editor(
-        must_df_view,
-        use_container_width=True,
-        num_rows="dynamic",
-        height=240,
-        key="u_must_view"
+    st.subheader("⛔ 必休（請選取本月日期）")
+    options = list(range(1, nd+1))
+    selected_days = st.multiselect(
+        "請選擇本月必休日期（可多選）",
+        options=options,
+        default=sorted(must_set),
+        format_func=lambda d: f"{year}-{month:02d}-{d:02d}"
     )
-    st.caption("註：無需填 id，系統自動用你的員編存檔。")
+    must_days = set(selected_days)
 
-    # 用畫面中的必休 → 自動推算「想休 = 其他所有日期」
+    # 想休 = 其餘所有日期
     all_days = set(range(1, nd+1))
-    safe_days = []
-    for x in must_df_view["date"].tolist():
-        dt = pd.to_datetime(x, errors="coerce")
-        if not pd.isna(dt) and int(dt.year)==int(year) and int(dt.month)==int(month):
-            safe_days.append(int(dt.day))
-    must_days = set(safe_days)
-    calc_wish = sorted(list(all_days - must_days))
+    wish_days = sorted(list(all_days - must_days))
     wish_df_preview = pd.DataFrame({
-        "date": [f"{year}-{month:02d}-{d:02d}" for d in calc_wish]
+        "date": [f"{year}-{month:02d}-{d:02d}" for d in wish_days]
     })
 
-    st.subheader("📝 想休（系統自動：除必休外的所有日期）")
-    st.dataframe(wish_df_preview, use_container_width=True, height=240)
-    st.caption("儲存後，系統會把『除必休以外的所有日子』當成你想休。")
+    col_u1, col_u2 = st.columns(2)
+    with col_u1:
+        st.write("你選擇的必休日：")
+        must_preview = pd.DataFrame({
+            "date": [f"{year}-{month:02d}-{d:02d}" for d in sorted(must_days)]
+        })
+        st.dataframe(must_preview, use_container_width=True, height=240)
+    with col_u2:
+        st.write("系統自動產生的想休日（其餘天數）：")
+        st.dataframe(wish_df_preview, use_container_width=True, height=240)
 
     if st.button("💾 儲存我的請休（必休 + 想休自動）"):
         # 必休
-        new_must_rows = []
-        for x in must_df_view["date"].tolist():
-            dt = pd.to_datetime(x, errors="coerce")
-            if pd.isna(dt):
-                continue
-            if int(dt.year)==int(year) and int(dt.month)==int(month):
-                new_must_rows.append({
-                    "nurse_id": my_id,
-                    "date": f"{year}-{month:02d}-{int(dt.day):02d}",
-                    "type": "must"
-                })
-        must_new_df = pd.DataFrame(new_must_rows)
+        must_new_rows = [{
+            "nurse_id": my_id,
+            "date": f"{year}-{month:02d}-{d:02d}",
+            "type": "must"
+        } for d in sorted(must_days)]
 
-        # 想休
-        auto_wish_rows = [{
+        # 想休 = 所有日 - 必休
+        wish_new_rows = [{
             "nurse_id": my_id,
             "date": f"{year}-{month:02d}-{d:02d}",
             "type": "wish"
         } for d in range(1, nd+1) if d not in must_days]
-        wish_new_df = pd.DataFrame(auto_wish_rows)
+
+        must_new_df = pd.DataFrame(must_new_rows)
+        wish_new_df = pd.DataFrame(wish_new_rows)
 
         others = prefs_df[prefs_df["nurse_id"] != my_id].copy()
         merged = pd.concat([others, must_new_df, wish_new_df], ignore_index=True)
@@ -350,7 +349,6 @@ st.success("✅ 以護理長（管理者）身份登入")
 st.subheader("👥 人員清單（員工也可自助註冊）")
 users_raw = load_users().copy()
 
-# 轉成 bool 給 Checkbox 用
 users_view = users_raw.copy()
 users_view["senior"] = users_view["senior"].astype(str).str.upper().isin(["TRUE","1","YES","Y","T"])
 users_view["junior"] = users_view["junior"].astype(str).str.upper().isin(["TRUE","1","YES","Y","T"])
@@ -374,7 +372,6 @@ users_view = st.data_editor(
 
 if st.button("💾 儲存人員清單"):
     users_out = users_view.copy()
-    # 勾選 → TRUE/FALSE 字串
     users_out["senior"] = users_out["senior"].map(lambda v: "TRUE" if bool(v) else "FALSE")
     users_out["junior"] = users_out["junior"].map(lambda v: "TRUE" if bool(v) else "FALSE")
     save_users(users_out)
@@ -456,13 +453,15 @@ df_demand = st.data_editor(
     key="demand_editor"
 )
 
-# 6) 排班規則
+# 6) 排班規則（min_off + 目標 10 天）
 st.subheader("⚙️ 排班規則")
 allow_cross         = st.checkbox("允許同日跨班平衡（以能力單位）", value=True)
 prefer_off_holiday  = st.checkbox("假日優先排休（能休就自動打 O）", value=True)
 min_monthly_off     = st.number_input("每人每月最少 O 天數", 0, 31, 8, 1)
 balance_monthly_off = st.checkbox("盡量讓每人 O 天數接近（平衡）", value=True)
 min_work_stretch    = st.number_input("最小連續上班天數（避免上一兩天就休）", 2, 7, 3, 1)
+
+TARGET_OFF_DAYS = 10  # 盡量控制在 10 天左右
 
 # =============== 排班演算法 ===============
 def build_initial_schedule(year, month, users_df, prefs_df, demand_df,
@@ -538,7 +537,7 @@ def build_initial_schedule(year, month, users_df, prefs_df, demand_df,
 
     def person_units_on(nid, s):
         return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.5)
+                                s, d_avg, e_avg, n_avg, 4.0)
 
     # 先標必休
     for nid in id_list:
@@ -579,7 +578,7 @@ def build_initial_schedule(year, month, users_df, prefs_df, demand_df,
                 if not pool:
                     break
 
-                # ★ 新規則：這個班別當天尚未有資深 → 不先排新人
+                # 這個班別當天尚未有資深 → 不先排新人
                 if senior_cnt == 0:
                     non_j = [nid for nid in pool if not junior_map.get(nid, False)]
                     if non_j:
@@ -644,7 +643,7 @@ def build_initial_schedule(year, month, users_df, prefs_df, demand_df,
 
     return sched, demand, role_map, id_list, senior_map, junior_map, wcap_map, must_map, wish_map
 
-# ===== 跨班平衡（只調整非新人） =====
+# ===== 跨班平衡（不動新人） =====
 def cross_shift_balance_with_units(year, month, id_list, sched,
                                    demand, role_map, senior_map, junior_map,
                                    d_avg, e_avg, n_avg):
@@ -652,7 +651,7 @@ def cross_shift_balance_with_units(year, month, id_list, sched,
 
     def units_of(nid, s):
         return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.5)
+                                s, d_avg, e_avg, n_avg, 4.0)
 
     for d in range(1, nd+1):
         actual = {s: sum(units_of(nid,s) for nid in id_list if sched[nid][d]==s)
@@ -728,7 +727,7 @@ def prefer_off_on_holidays(year, month, sched, demand_df, id_list,
 
     def units_of(nid, s):
         return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.5)
+                                s, d_avg, e_avg, n_avg, 4.0)
 
     def white_senior_ok_if_remove(d, nid):
         if sched[nid][d] != "D":
@@ -793,7 +792,7 @@ def enforce_weekly_one_off(year, month, sched, demand_df, id_list,
 
     def units_of(nid, s):
         return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.5)
+                                s, d_avg, e_avg, n_avg, 4.0)
 
     def actual_units(d, s):
         return sum(units_of(nid,s) for nid in id_list if sched[nid][d]==s)
@@ -840,14 +839,19 @@ def enforce_weekly_one_off(year, month, sched, demand_df, id_list,
                 break
     return sched
 
-# ===== 每人每月至少 min_off & 平衡 O 數 =====
+# ===== 每人每月至少 min_off & 盡量靠近 target_off（10 天） =====
 def enforce_min_monthly_off(year, month, sched, demand_df, id_list,
                             role_map, senior_map, junior_map,
                             d_avg, e_avg, n_avg,
-                            min_off=8, balance=True, holiday_set=None):
+                            min_off=8, balance=True, holiday_set=None,
+                            target_off=10):
     nd = days_in_month(year, month)
     if holiday_set is None:
         holiday_set = set()
+    if target_off is None:
+        target_off = min_off
+    target_off = max(min_off, target_off)  # 避免 target < min_off
+
     demand = {int(r.day):{
                 "D":(int(r.D_min_units),int(r.D_max_units)),
                 "E":(int(r.E_min_units),int(r.E_max_units)),
@@ -859,7 +863,7 @@ def enforce_min_monthly_off(year, month, sched, demand_df, id_list,
 
     def units_of(nid, s):
         return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.5)
+                                s, d_avg, e_avg, n_avg, 4.0)
 
     def actual_units(d, s):
         return sum(units_of(nid,s) for nid in id_list if sched[nid][d]==s)
@@ -878,6 +882,8 @@ def enforce_min_monthly_off(year, month, sched, demand_df, id_list,
         return sum(1 for d in range(1, nd+1) if sched[nid][d]=="O")
 
     def try_add_one_off(nid):
+        if off_count(nid) >= target_off:
+            return False
         work_days = [(d, sched[nid][d]) for d in range(1, nd+1)
                      if sched[nid][d] in ("D","E","N")]
         if not work_days:
@@ -916,7 +922,7 @@ def enforce_min_monthly_off(year, month, sched, demand_df, id_list,
     if not balance:
         return sched
 
-    # 再嘗試平衡 O（差距 > 1 的話）
+    # 再嘗試平衡 O（差距 > 1 的話，且盡量不超過 target_off）
     def off_span():
         cnts = [off_count(n) for n in id_list]
         return (max(cnts) if cnts else 0) - (min(cnts) if cnts else 0)
@@ -944,7 +950,7 @@ def enforce_min_work_stretch(year, month, sched, demand_df, id_list,
 
     def units_of(nid, s):
         return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.5)
+                                s, d_avg, e_avg, n_avg, 4.0)
 
     def actual_units(d, s):
         return sum(units_of(x,s) for x in id_list if sched[x][d]==s)
@@ -1061,7 +1067,7 @@ def run_schedule(df_demand):
     else:
         holiday_set = set()
 
-    # 週休 & 月休
+    # 週休 & 月休（target_off = 10）
     sched = enforce_weekly_one_off(
         year, month, sched, df_demand, id_list,
         role_map, senior_map, junior_map,
@@ -1073,7 +1079,8 @@ def run_schedule(df_demand):
         d_avg, e_avg, n_avg,
         min_off=min_monthly_off,
         balance=balance_monthly_off,
-        holiday_set=holiday_set
+        holiday_set=holiday_set,
+        target_off=TARGET_OFF_DAYS
     )
 
     # 最小連續上班天數
@@ -1119,7 +1126,7 @@ def run_schedule(df_demand):
         "id": nid,
         "shift": role_map[nid],
         "senior": senior_map.get(nid,False),
-        "junior": junior_map.get(nid,False),
+        "junior": senior_map.get(nid,False) if False else junior_map.get(nid,False),
         "D天數": count_code(nid,"D"),
         "E天數": count_code(nid,"E"),
         "N天數": count_code(nid,"N"),
@@ -1132,7 +1139,7 @@ def run_schedule(df_demand):
     def person_units_on(nid, s):
         return per_person_units(
             junior_map.get(nid,False),
-            s, d_avg, e_avg, n_avg, 4.5
+            s, d_avg, e_avg, n_avg, 4.0
         )
 
     comp_rows = []
@@ -1191,4 +1198,5 @@ if st.button("🚀 產生班表（以員工編號為 id）", type="primary"):
         file_name=f"compliance_{year}-{month:02d}.csv"
     )
 else:
-    st.info("流程建議：\n1️⃣ 同仁登入 → 填必休（系統自動算想休）\n2️⃣ 護理長設定床數、護病比、加開人力、假日\n3️⃣ 按下『產生班表』即可。")
+    st.info("流程建議：\n1️⃣ 同仁登入 → 用【選取】填必休（其餘自動變想休）\n2️⃣ 護理長設定床數、護病比、加開人力、假日\n3️⃣ 按下『產生班表』即可。")
+
