@@ -936,12 +936,15 @@ def enforce_min_monthly_off(year, month, sched, demand_df, id_list,
 
     return sched
 
-# ===== 最小連續上班天數（避免上一兩天就休） =====
+# ===== 最小連續上班天數（避免上一兩天就休），必休日不動 =====
 def enforce_min_work_stretch(year, month, sched, demand_df, id_list,
                              role_map, senior_map, junior_map,
                              d_avg, e_avg, n_avg, min_stretch=3,
-                             holiday_set=None):
+                             holiday_set=None, must_map=None):
     nd = days_in_month(year, month)
+    if must_map is None:
+        must_map = {}
+
     demand = {int(r.day):{
                 "D":(int(r.D_min_units),int(r.D_max_units)),
                 "E":(int(r.E_min_units),int(r.E_max_units)),
@@ -984,6 +987,10 @@ def enforce_min_work_stretch(year, month, sched, demand_df, id_list,
         return k
 
     def try_move_off_forward(nid, d):
+        # ⭐ 防呆：如果 d 是必休日，完全不能改
+        if d in must_map.get(nid, set()):
+            return False
+
         s_fixed = role_map[nid]
         if s_fixed not in ("D","E","N"):
             return False
@@ -1020,6 +1027,9 @@ def enforce_min_work_stretch(year, month, sched, demand_df, id_list,
         changed = False
         for nid in id_list:
             for d in range(1, nd+1):
+                # ⭐ 必休日的 O 不可以被動
+                if d in must_map.get(nid, set()):
+                    continue
                 if sched[nid][d] != "O":
                     continue
                 if work_streak_before(nid, d) < min_stretch:
@@ -1049,7 +1059,7 @@ def run_schedule(df_demand):
     # 假日優先排 O
     if prefer_off_holiday:
         hol_df = load_holidays(year, month)
-        holiday_set = set()
+        holiday_set_local = set()
         for r in hol_df.itertuples(index=False):
             raw = getattr(r,"date","")
             if pd.isna(raw) or str(raw).strip()=="":
@@ -1058,20 +1068,20 @@ def run_schedule(df_demand):
             if pd.isna(dt):
                 continue
             if int(dt.year)==int(year) and int(dt.month)==int(month):
-                holiday_set.add(date(int(dt.year), int(dt.month), int(dt.day)))
+                holiday_set_local.add(date(int(dt.year), int(dt.month), int(dt.day)))
         sched = prefer_off_on_holidays(
             year, month, sched, df_demand, id_list,
             role_map, senior_map, junior_map,
-            d_avg, e_avg, n_avg, holiday_set
+            d_avg, e_avg, n_avg, holiday_set_local
         )
     else:
-        holiday_set = set()
+        holiday_set_local = set()
 
     # 週休 & 月休（target_off = 10）
     sched = enforce_weekly_one_off(
         year, month, sched, df_demand, id_list,
         role_map, senior_map, junior_map,
-        d_avg, e_avg, n_avg, holiday_set
+        d_avg, e_avg, n_avg, holiday_set_local
     )
     sched = enforce_min_monthly_off(
         year, month, sched, df_demand, id_list,
@@ -1079,17 +1089,18 @@ def run_schedule(df_demand):
         d_avg, e_avg, n_avg,
         min_off=min_monthly_off,
         balance=balance_monthly_off,
-        holiday_set=holiday_set,
+        holiday_set=holiday_set_local,
         target_off=TARGET_OFF_DAYS
     )
 
-    # 最小連續上班天數
+    # 最小連續上班天數（保護必休日）
     sched = enforce_min_work_stretch(
         year, month, sched, df_demand, id_list,
         role_map, senior_map, junior_map,
         d_avg, e_avg, n_avg,
         min_stretch=min_work_stretch,
-        holiday_set=holiday_set
+        holiday_set=holiday_set_local,
+        must_map=must_map
     )
 
     ndays = days_in_month(year, month)
@@ -1114,7 +1125,7 @@ def run_schedule(df_demand):
         return sum(1 for d in range(1, ndays+1) if sched[nid][d]==code)
 
     def is_hday(d):
-        return is_sunday(year, month, d) or (date(year,month,d) in holiday_set)
+        return is_sunday(year, month, d) or (date(year,month,d) in holiday_set_local)
 
     holiday_off = {
         nid: sum(1 for d in range(1, ndays+1)
@@ -1126,7 +1137,7 @@ def run_schedule(df_demand):
         "id": nid,
         "shift": role_map[nid],
         "senior": senior_map.get(nid,False),
-        "junior": senior_map.get(nid,False) if False else junior_map.get(nid,False),
+        "junior": junior_map.get(nid,False),
         "D天數": count_code(nid,"D"),
         "E天數": count_code(nid,"E"),
         "N天數": count_code(nid,"N"),
