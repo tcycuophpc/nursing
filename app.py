@@ -1691,7 +1691,15 @@ if st.button("🚀 產生班表（以員工編號為 id）", type="primary"):
     roster_df, summary_df, compliance_df = run_schedule(df_demand)
 
     st.subheader(f"📅 班表（{year}-{month:02d}）")
-    st.dataframe(roster_df, use_container_width=True, height=520)
+    # ⭐ 這裡把休假日(O)反紅
+    ndays = days_in_month(year, month)
+    day_cols = [str(d) for d in range(1, ndays+1) if str(d) in roster_df.columns]
+
+    def highlight_off(val):
+        return "background-color: #ffcccc" if val == "O" else ""
+
+    roster_styled = roster_df.style.applymap(highlight_off, subset=day_cols)
+    st.dataframe(roster_styled, use_container_width=True, height=520)
 
     st.subheader("📊 統計摘要（含資深/新人、例假日放假數）")
     st.dataframe(summary_df, use_container_width=True, height=360)
