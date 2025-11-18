@@ -1058,6 +1058,101 @@ def enforce_min_work_stretch(year, month, sched, demand_df, id_list,
                         changed = True
     return sched
 
+def hard_break_long_work_streaks(year, month, sched, demand_df, id_list,
+                                 role_map, senior_map, junior_map,
+                                 d_avg, e_avg, n_avg,
+                                 max_work_streak=5,
+                                 min_monthly_off=8,
+                                 must_map=None):
+    nd = days_in_month(year, month)
+    if must_map is None:
+        must_map = {}
+
+    demand = {int(r.day):{
+                "D":(int(r.D_min_units),int(r.D_max_units)),
+                "E":(int(r.E_min_units),int(r.E_max_units)),
+                "N":(int(r.N_min_units),int(r.N_max_units))}
+              for r in demand_df.itertuples(index=False)}
+
+    def units_of(nid, s):
+        return per_person_units(junior_map.get(nid,False),
+                                s, d_avg, e_avg, n_avg, 4.0)
+
+    def actual_units(d, s):
+        return sum(units_of(x,s) for x in id_list if sched[x][d]==s)
+
+    def min_units(d, s):
+        return demand.get(d,{}).get(s,(0,0))[0]
+
+    def white_senior_ok_if_remove(d, nid):
+        if sched[nid][d] != "D":
+            return True
+        d_people = [x for x in id_list if sched[x][d]=="D" and x != nid]
+        total = len(d_people)
+        if total==0:
+            return True
+        sen = sum(1 for x in d_people if senior_map.get(x,False))
+        return sen >= ceil(total/3)
+
+    work_codes = ("D","E","N")
+
+    def find_segments(nid):
+        segs = []
+        d = 1
+        while d <= nd:
+            if sched[nid][d] not in work_codes:
+                d += 1
+                continue
+            start = d
+            while d+1 <= nd and sched[nid][d+1] in work_codes:
+                d += 1
+            segs.append((start, d))
+            d += 1
+        return segs
+
+    def pick_break_day(nid, start, end):
+        center = (start + end) / 2.0
+        candidates = []
+        for day in range(start, end+1):
+            if day in must_map.get(nid, set()):
+                continue
+            shift_code = sched[nid][day]
+            if shift_code not in work_codes:
+                continue
+            mn = min_units(day, shift_code)
+            cur_units = actual_units(day, shift_code)
+            u = units_of(nid, shift_code)
+            if cur_units - u + 1e-9 < mn:
+                continue
+            if not white_senior_ok_if_remove(day, nid):
+                continue
+            remaining_slack = cur_units - u - mn
+            distance = abs(day - center)
+            candidates.append(( -remaining_slack, distance, day))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][2]
+
+    for nid in id_list:
+        while True:
+            segments = find_segments(nid)
+            changed = False
+            for start, end in segments:
+                length = end - start + 1
+                if length <= max_work_streak:
+                    continue
+                pick = pick_break_day(nid, start, end)
+                if pick is None:
+                    continue
+                sched[nid][pick] = "O"
+                changed = True
+                break
+            if not changed:
+                break
+    return sched
+
+
 def enforce_streak_preferences(year, month, sched, demand_df, id_list,
                                role_map, senior_map, junior_map,
                                d_avg, e_avg, n_avg,
@@ -1114,37 +1209,14 @@ def enforce_streak_preferences(year, month, sched, demand_df, id_list,
         sen = sum(1 for x in d_people if senior_map.get(x,False))
         return sen >= ceil(total/3)
 
-    # 1) 最大連續上班天數（> max_work_streak 會試圖插 O）
-    for nid in id_list:
-        d = 1
-        while d <= nd:
-            if sched[nid][d] not in ("D","E","N"):
-                d += 1
-                continue
-            start = d
-            while d+1 <= nd and sched[nid][d+1] in ("D","E","N"):
-                d += 1
-            end = d
-            length = end - start + 1
-            if length > max_work_streak:
-                for mid in range(start+1, end):
-                    if mid in must_map.get(nid,set()):
-                        continue
-                    s_mid = sched[nid][mid]
-                    mn = demand.get(mid,{}).get(s_mid,(0,0))[0]
-                    u  = units_of(nid, s_mid)
-                    if actual_units(mid, s_mid) - u + 1e-9 < mn:
-                        continue
-                    if not white_senior_ok_if_remove(mid, nid):
-                        continue
-                    if off_total(nid) + 1 > target_off + 2:
-                        continue
-                    if not (rest_ok(sched[nid].get(mid-1,""), "O") and
-                            rest_ok("O", sched[nid].get(mid+1,""))):
-                        continue
-                    sched[nid][mid] = "O"
-                    break
-            d += 1
+    sched = hard_break_long_work_streaks(
+        year, month, sched, demand_df, id_list,
+        role_map, senior_map, junior_map,
+        d_avg, e_avg, n_avg,
+        max_work_streak=max_work_streak,
+        min_monthly_off=min_monthly_off,
+        must_map=must_map,
+    )
 
     # 2) 限制連續休假天數（> max_off_streak 時嘗試插上班）
     for nid in id_list:
