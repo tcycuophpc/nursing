@@ -182,7 +182,7 @@ def sidebar_auth():
     pwd  = st.sidebar.text_input("密碼（員工：身分證末四碼）",
                                  type="password",
                                  value=st.session_state.get("pwd",""))
-    login_btn = st.sidebar.button("登入 / 验證")
+    login_btn = st.sidebar.button("登入 / 驗證")
 
     with st.sidebar.expander("首次使用？點我自助註冊"):
         rid   = st.text_input("員工編號（作為帳號）", key="reg_id")
@@ -466,17 +466,25 @@ df_demand = st.data_editor(
 st.subheader("⚙️ 排班規則")
 allow_cross         = st.checkbox("允許同日跨班平衡（以能力單位）", value=True)
 prefer_off_holiday  = st.checkbox("假日優先排休（能休就自動打 O）", value=True)
-min_monthly_off     = st.number_input("每人每月最少 O 天數", 0, 31, 8, 1)
+
+# 休假相關：至少幾天 O、要不要平均
+min_monthly_off     = st.number_input("每人每月最少 O 天數（休假天數下限）", 0, 31, 8, 1)
 balance_monthly_off = st.checkbox("盡量讓每人 O 天數接近（平衡）", value=True)
+
+# 連班相關：避免破碎上班段
 min_work_stretch    = st.number_input("最小連續上班天數（避免上一兩天就休）", 2, 7, 3, 1)
 
-# 半月休假基底與連班 / 連休規則
-MIN_OFF_BEFORE_15 = 5   # 1–15 至少 5 天休
-MIN_OFF_AFTER_15  = 3   # 16–月底至少 3 天休
+# ✅ 新增：每月「最少 / 最多」上班天數限制
+min_work_days = st.number_input("每人每月最少上班天數", 0, nd, 15, 1)
+max_work_days = st.number_input("每人每月最多上班天數", 0, nd, 22, 1)
 
-TARGET_OFF_DAYS = 10    # 目標月休 ≈ 10 天
-MAX_WORK_STREAK = 5     # 最大連續上班 5 天
-MAX_OFF_STREAK  = 2     # 連續休假盡量不超過 2 天
+# 「半月休假基底」改為 0，代表不強制依 1–15 / 16–月底切半
+MIN_OFF_BEFORE_15 = 0
+MIN_OFF_AFTER_15  = 0
+
+TARGET_OFF_DAYS = 10    # 目標月休 ≈ 10 天（整體）
+MAX_WORK_STREAK  = 5     # 最大連續上班 5 天
+MAX_OFF_STREAK   = 2     # 連續休假盡量不超過 2 天
 
 # ================== 排班主邏輯：initial ==================
 def build_initial_schedule(year, month, users_df, prefs_df, demand_df,
@@ -950,115 +958,6 @@ def enforce_min_monthly_off(year, month, sched, demand_df, id_list,
 
     return sched
 
-def enforce_halfmonth_off_base(year, month, sched, demand_df, id_list,
-                               role_map, senior_map, junior_map,
-                               d_avg, e_avg, n_avg,
-                               min_before=5, min_after=3,
-                               min_off_total=8, target_off=10,
-                               holiday_set=None, must_map=None):
-    nd = days_in_month(year, month)
-    if holiday_set is None:
-        holiday_set = set()
-    if must_map is None:
-        must_map = {}
-
-    demand = {int(r.day):{
-                "D":(int(r.D_min_units),int(r.D_max_units)),
-                "E":(int(r.E_min_units),int(r.E_max_units)),
-                "N":(int(r.N_min_units),int(r.N_max_units))}
-              for r in demand_df.itertuples(index=False)}
-
-    def is_hday(d):
-        return is_sunday(year, month, d) or (date(year,month,d) in holiday_set)
-
-    def units_of(nid, s):
-        return per_person_units(junior_map.get(nid,False),
-                                s, d_avg, e_avg, n_avg, 4.0)
-
-    def actual_units(d, s):
-        return sum(units_of(nid,s) for nid in id_list if sched[nid][d]==s)
-
-    def white_senior_ok_if_remove(d, nid):
-        if sched[nid][d] != "D":
-            return True
-        d_people = [x for x in id_list if sched[x][d]=="D" and x != nid]
-        total = len(d_people)
-        if total==0:
-            return True
-        sen = sum(1 for x in d_people if senior_map.get(x,False))
-        return sen >= ceil(total/3)
-
-    def off_count_all(nid):
-        return sum(1 for d in range(1, nd+1) if sched[nid][d]=="O")
-
-    def off_count_before(nid):
-        return sum(1 for d in range(1, min(15, nd)+1) if sched[nid][d]=="O")
-
-    def off_count_after(nid):
-        return sum(1 for d in range(16, nd+1) if sched[nid][d]=="O")
-
-    def try_add_one_off_in_range(nid, start_day, end_day):
-        if off_count_all(nid) >= target_off:
-            return False
-        days = [d for d in range(start_day, end_day+1)
-                if 1 <= d <= nd and sched[nid][d] in ("D","E","N")
-                and d not in must_map.get(nid, set())]
-        if not days:
-            return False
-        scored = []
-        for d in days:
-            s = sched[nid][d]
-            mn = demand.get(d,{}).get(s,(0,0))[0]
-            u  = units_of(nid, s)
-            slack = actual_units(d, s) - mn
-            feasible = (slack + 1e-9 >= u) and white_senior_ok_if_remove(d,nid) \
-                       and rest_ok(sched[nid].get(d-1,""), "O") \
-                       and rest_ok("O", sched[nid].get(d+1,""))
-            if feasible:
-                scored.append((1 if is_hday(d) else 2, -slack, d))
-        if not scored:
-            return False
-        scored.sort()
-        chosen_d = scored[0][2]
-        sched[nid][chosen_d] = "O"
-        return True
-
-    changed = True
-    guard = 0
-    while changed and guard < 50:
-        changed = False
-        guard += 1
-        for nid in id_list:
-            b = off_count_before(nid)
-            a = off_count_after(nid)
-            total = off_count_all(nid)
-            if total < min_off_total:
-                need = min_off_total - total
-                for _ in range(need):
-                    if b < min_before:
-                        if try_add_one_off_in_range(nid, 1, min(15, nd)):
-                            b += 1
-                            total += 1
-                            changed = True
-                            continue
-                    if a < min_after:
-                        if try_add_one_off_in_range(nid, 16, nd):
-                            a += 1
-                            total += 1
-                            changed = True
-                            continue
-                continue
-
-            if b < min_before and off_count_all(nid) < target_off:
-                if try_add_one_off_in_range(nid, 1, min(15, nd)):
-                    changed = True
-                    continue
-            if a < min_after and off_count_all(nid) < target_off:
-                if try_add_one_off_in_range(nid, 16, nd):
-                    changed = True
-                    continue
-    return sched
-
 def enforce_min_work_stretch(year, month, sched, demand_df, id_list,
                              role_map, senior_map, junior_map,
                              d_avg, e_avg, n_avg, min_stretch=3,
@@ -1164,7 +1063,7 @@ def enforce_streak_preferences(year, month, sched, demand_df, id_list,
                                d_avg, e_avg, n_avg,
                                max_work_streak=5, max_off_streak=2,
                                min_monthly_off=8,
-                               min_before=5, min_after=3,
+                               min_before=0, min_after=0,
                                target_off=10,
                                holiday_set=None, must_map=None):
     nd = days_in_month(year, month)
@@ -1269,10 +1168,10 @@ def enforce_streak_preferences(year, month, sched, demand_df, id_list,
                     if mid in must_map.get(nid,set()):
                         continue
                     if mid <= 15:
-                        if off_before(nid) - 1 < min_before:
+                        if min_before > 0 and off_before(nid) - 1 < min_before:
                             continue
                     else:
-                        if off_after(nid) - 1 < min_after:
+                        if min_after > 0 and off_after(nid) - 1 < min_after:
                             continue
                     if off_total(nid) - 1 < min_monthly_off:
                         continue
@@ -1388,8 +1287,8 @@ def smooth_short_work_segments(year, month, sched, demand_df, id_list,
                                d_avg, e_avg, n_avg,
                                min_stretch=3,
                                min_monthly_off=8,
-                               min_before=5,
-                               min_after=3,
+                               min_before=0,
+                               min_after=0,
                                holiday_set=None,
                                must_map=None):
     nd = days_in_month(year, month)
@@ -1449,8 +1348,8 @@ def smooth_short_work_segments(year, month, sched, demand_df, id_list,
                     ld = start - 1
                     if ld >= 1 and sched[nid][ld] == "O" and ld not in must_map.get(nid,set()):
                         if off_total(nid) - 1 >= min_monthly_off:
-                            if (ld <= 15 and off_before(nid) - 1 >= min_before) or \
-                               (ld >= 16 and off_after(nid) - 1 >= min_after):
+                            if (ld <= 15 and (min_before == 0 or off_before(nid) - 1 >= min_before)) or \
+                               (ld >= 16 and (min_after == 0 or off_after(nid) - 1 >= min_after)):
                                 s_fixed = role_map[nid]
                                 if s_fixed in ("D","E","N"):
                                     mn, mx = demand.get(ld,{}).get(s_fixed,(0,0))
@@ -1465,8 +1364,8 @@ def smooth_short_work_segments(year, month, sched, demand_df, id_list,
                     rd = end + 1
                     if length < min_stretch and rd <= nd and sched[nid][rd] == "O" and rd not in must_map.get(nid,set()):
                         if off_total(nid) - 1 >= min_monthly_off:
-                            if (rd <= 15 and off_after(nid) - 1 >= min_after) or \
-                               (rd >= 16 and off_after(nid) - 1 >= min_after):
+                            if (rd <= 15 and (min_before == 0 or off_before(nid) - 1 >= min_before)) or \
+                               (rd >= 16 and (min_after == 0 or off_after(nid) - 1 >= min_after)):
                                 s_fixed = role_map[nid]
                                 if s_fixed in ("D","E","N"):
                                     mn, mx = demand.get(rd,{}).get(s_fixed,(0,0))
@@ -1536,6 +1435,173 @@ def ensure_no_seven_consecutive_work(year, month, sched, id_list, must_map=None)
 
     return sched
 
+def enforce_workday_limits(year, month, sched, demand_df, id_list,
+                           role_map, senior_map, junior_map,
+                           d_avg, e_avg, n_avg,
+                           min_work_days, max_work_days,
+                           min_monthly_off, max_work_streak,
+                           holiday_set=None, must_map=None):
+    """
+    限制每個人「本月總上班天數」介於 [min_work_days, max_work_days]：
+      - 若超過 max_work_days：找幾天上班改成 O
+      - 若低於 min_work_days：找幾天 O 改成該人的固定班別
+    並且：
+      - 不打破每日 min_units
+      - 白班仍維持資深 >= 1/3
+      - 不把月休壓到 min_monthly_off 以下
+      - 不製造 > max_work_streak 或 >=7 天連班
+    """
+    nd = days_in_month(year, month)
+
+    # 防呆：若設定顛倒就互換
+    if min_work_days > max_work_days:
+        min_work_days, max_work_days = max_work_days, min_work_days
+
+    # 需求表轉成好查的 dict
+    demand = {
+        int(r.day): {
+            "D": (int(r.D_min_units), int(r.D_max_units)),
+            "E": (int(r.E_min_units), int(r.E_max_units)),
+            "N": (int(r.N_min_units), int(r.N_max_units)),
+        }
+        for r in demand_df.itertuples(index=False)
+    }
+
+    if holiday_set is None:
+        holiday_set = set()
+    if must_map is None:
+        must_map = {nid: set() for nid in id_list}
+
+    def is_hday(d):
+        return is_sunday(year, month, d) or (date(year, month, d) in holiday_set)
+
+    def units_of(nid, s):
+        return per_person_units(junior_map.get(nid, False),
+                                s, d_avg, e_avg, n_avg, 4.0)
+
+    def actual_units(d, s):
+        return sum(units_of(x, s) for x in id_list if sched[x][d] == s)
+
+    def off_total(nid):
+        return sum(1 for d in range(1, nd + 1) if sched[nid][d] == "O")
+
+    def work_total(nid):
+        return sum(1 for d in range(1, nd + 1) if sched[nid][d] in ("D", "E", "N"))
+
+    def white_senior_ok_if_remove(d, nid):
+        """把某人從 D 改成 O 後，白班資深比例是否仍 >= 1/3"""
+        if sched[nid][d] != "D":
+            return True
+        d_people = [x for x in id_list if sched[x][d] == "D" and x != nid]
+        total = len(d_people)
+        if total == 0:
+            return True
+        sen = sum(1 for x in d_people if senior_map.get(x, False))
+        return sen >= ceil(total / 3)
+
+    def white_senior_ok_if_add(d, nid):
+        """把某人從 O 改成 D 後，白班資深比例是否仍 >= 1/3"""
+        if role_map[nid] != "D":
+            return True
+        d_people = [x for x in id_list if sched[x][d] == "D"] + [nid]
+        total = len(d_people)
+        if total == 0:
+            return True
+        sen = sum(1 for x in d_people if senior_map.get(x, False))
+        return sen >= ceil(total / 3)
+
+    def work_streak_if_add(nid, d):
+        """假設在第 d 天改成上班，計算這一天附近的連續上班長度"""
+        left = 0
+        dd = d - 1
+        while dd >= 1 and sched[nid][dd] in ("D", "E", "N"):
+            left += 1
+            dd -= 1
+        right = 0
+        dd = d + 1
+        while dd <= nd and sched[nid][dd] in ("D", "E", "N"):
+            right += 1
+            dd += 1
+        return left + 1 + right
+
+    # ---------- A. 先處理「上班太多」的人，讓 work_total <= max_work_days ----------
+    for nid in id_list:
+        while work_total(nid) > max_work_days:
+            candidates = []
+            for d in range(1, nd + 1):
+                if d in must_map.get(nid, set()):
+                    continue
+                s = sched[nid][d]
+                if s not in ("D", "E", "N"):
+                    continue
+                mn, _mx = demand.get(d, {}).get(s, (0, 0))
+                u = units_of(nid, s)
+                # 移除之後不能低於最小需求
+                if actual_units(d, s) - u + 1e-9 < mn:
+                    continue
+                if not white_senior_ok_if_remove(d, nid):
+                    continue
+                if not (rest_ok(sched[nid].get(d - 1, ""), "O") and
+                        rest_ok("O", sched[nid].get(d + 1, ""))):
+                    continue
+                slack = actual_units(d, s) - mn
+                candidates.append((0 if is_hday(d) else 1, -slack, d))
+
+            if not candidates:
+                break
+
+            candidates.sort()
+            _, _, chosen_d = candidates[0]
+            sched[nid][chosen_d] = "O"
+
+    # ---------- B. 再處理「上班太少」的人，讓 work_total >= min_work_days ----------
+    for nid in id_list:
+        while work_total(nid) < min_work_days:
+            candidates = []
+            s_fixed = role_map[nid]
+            if s_fixed not in ("D", "E", "N"):
+                break
+
+            for d in range(1, nd + 1):
+                if d in must_map.get(nid, set()):
+                    continue
+                if sched[nid][d] != "O":
+                    continue
+                # 不能把月休壓到小於 min_monthly_off
+                if off_total(nid) - 1 < min_monthly_off:
+                    continue
+
+                mn, mx = demand.get(d, {}).get(s_fixed, (0, 0))
+                u = units_of(nid, s_fixed)
+                # 加上去不能超過 max_units
+                if actual_units(d, s_fixed) + u > mx + 1e-9:
+                    continue
+                # 前一天、隔一天 11 小時休息 + 不製造太長連班
+                if not (rest_ok(sched[nid].get(d - 1, ""), s_fixed) and
+                        rest_ok(s_fixed, sched[nid].get(d + 1, ""))):
+                    continue
+
+                new_streak = work_streak_if_add(nid, d)
+                if new_streak > max_work_streak:
+                    continue
+                if new_streak >= 7:  # 絕對不要連七
+                    continue
+
+                if not white_senior_ok_if_add(d, nid):
+                    continue
+
+                slack = mx - (actual_units(d, s_fixed) + u)
+                candidates.append((1 if is_hday(d) else 0, -slack, d))
+
+            if not candidates:
+                break
+
+            candidates.sort()
+            _, _, chosen_d = candidates[0]
+            sched[nid][chosen_d] = s_fixed
+
+    return sched
+
 # ================== 整體排班流程 ==================
 def run_schedule(df_demand):
     users_df = load_users()
@@ -1590,17 +1656,7 @@ def run_schedule(df_demand):
         target_off=TARGET_OFF_DAYS
     )
 
-    sched = enforce_halfmonth_off_base(
-        year, month, sched, df_demand, id_list,
-        role_map, senior_map, junior_map,
-        d_avg, e_avg, n_avg,
-        min_before=MIN_OFF_BEFORE_15,
-        min_after=MIN_OFF_AFTER_15,
-        min_off_total=min_monthly_off,
-        target_off=TARGET_OFF_DAYS,
-        holiday_set=holiday_set_local,
-        must_map=must_map
-    )
+    # 不再使用「1–15 休 5 天、16–月底休 3 天」的半月基底規則
 
     sched = enforce_min_work_stretch(
         year, month, sched, df_demand, id_list,
@@ -1646,9 +1702,22 @@ def run_schedule(df_demand):
         must_map=must_map
     )
 
-    # 🧱 最後防線：絕對不允許連七
+    # 🧱 先確保絕對不會連七
     sched = ensure_no_seven_consecutive_work(
         year, month, sched, id_list, must_map
+    )
+
+    # ✅ 再依「本月上班最少 / 最多天數」做最後微調（不打破連班限制）
+    sched = enforce_workday_limits(
+        year, month, sched, df_demand, id_list,
+        role_map, senior_map, junior_map,
+        d_avg, e_avg, n_avg,
+        min_work_days=min_work_days,
+        max_work_days=max_work_days,
+        min_monthly_off=min_monthly_off,
+        max_work_streak=MAX_WORK_STREAK,
+        holiday_set=holiday_set_local,
+        must_map=must_map
     )
 
     ndays = days_in_month(year, month)
@@ -1671,12 +1740,12 @@ def run_schedule(df_demand):
     def count_code(nid, code):
         return sum(1 for d in range(1, ndays+1) if sched[nid][d]==code)
 
-    def is_hday(d):
+    def is_hday2(d):
         return is_sunday(year, month, d) or (date(year,month,d) in holiday_set_local)
 
     holiday_off = {
         nid: sum(1 for d in range(1, ndays+1)
-                 if is_hday(d) and sched[nid][d]=="O")
+                 if is_hday2(d) and sched[nid][d]=="O")
         for nid in id_list
     }
 
@@ -1769,11 +1838,13 @@ else:
         "2️⃣ 護理長設定床數、護病比、加開人力、假日\n"
         "3️⃣ 按下『產生班表』即可。\n\n"
         "本版規則：\n"
-        "• 每月 1–15 至少休 5 天，16–月底至少休 3 天\n"
-        "• 每人每月至少休 8 天，目標約 10 天，盡量平均\n"
+        "• 每人每月至少 O 天數（你在上方設定）\n"
+        "• 可以設定每人每月【最少 / 最多上班天數】\n"
+        "• 盡量讓每人 O 天數接近（平均）\n"
         "• 盡量 3–4 天上班為一個週期，最大連續上班 5 天\n"
         "• 連續休假盡量不超過 2 天\n"
         "• 盡量避免『上一天休一天』的短上班段\n"
         "• 跨班別與所有班別銜接皆檢查 11 小時休息\n"
-        "• 新人護病比 1:4，排在資深旁邊使用；白班資深至少 1/3。"
+        "• 新人護病比 1:4；白班資深至少 1/3；不允許連七上班。"
     )
+
